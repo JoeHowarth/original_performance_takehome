@@ -93,10 +93,7 @@ class KernelBuilder:
             slots.append({"debug": [("vcompare", val_hash_addr, [(round, batch_base + j, "hash_stage", hi) for j in range(VLEN)])]})
         return slots
 
-
-    def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
-    ):
+    def build_kernel(self, forest_height: int, n_nodes: int, batch_size: int, rounds: int):
         """
         Like reference_kernel2 but building actual instructions.
         Scalar implementation using only scalar ALU and load/store.
@@ -150,7 +147,7 @@ class KernelBuilder:
         tmp_val = self.alloc_scratch("tmp_val", VLEN)
         tmp_node_val = self.alloc_scratch("tmp_node_val", VLEN)
         tmp_addr = self.alloc_scratch("tmp_addr", VLEN)
-
+        tmp_addr2 = self.alloc_scratch("tmp_addr2", VLEN)
 
         instrs: list[dict[str, list]] = []
 
@@ -160,19 +157,25 @@ class KernelBuilder:
                 i_batch_const = self.scratch_const(batch_base)
 
                 # idx = mem[inp_indices_p + i]
-                instrs.append({"alu": [("+", tmp_addr, self.scratch["inp_indices_p"], i_batch_const)]})
-                instrs.append({"load": [("vload", tmp_idx, tmp_addr)]})
-                instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "idx") for j in range(VLEN)])]})
                 # val = mem[inp_values_p + i]
-                instrs.append({"alu": [("+", tmp_addr, self.scratch["inp_values_p"], i_batch_const)]})
-                instrs.append({"load": [("vload", tmp_val, tmp_addr)]})
+                instrs.append(
+                    {
+                        "alu": [
+                            ("+", tmp_addr, self.scratch["inp_indices_p"], i_batch_const),
+                            ("+", tmp_addr2, self.scratch["inp_values_p"], i_batch_const),
+                        ]
+                    }
+                )
+                instrs.append({"load": [("vload", tmp_idx, tmp_addr), ("vload", tmp_val, tmp_addr2)]})
+                instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "idx") for j in range(VLEN)])]})
                 instrs.append({"debug": [("vcompare", tmp_val, [(round, batch_base + j, "val") for j in range(VLEN)])]})
 
                 # node_val = mem[forest_values_p + idx]
                 # Bad scalar loads and counter incrs to handle non-contiguous value loads
+
+                instrs.append({"alu": [("+", vtmp3 + j, self.scratch["forest_values_p"], tmp_idx + j) for j in range(8)]})
                 for j in range(8):
-                    instrs.append({"alu": [("+", tmp3, self.scratch["forest_values_p"], tmp_idx + j)]})
-                    instrs.append({"load": [("load", tmp_node_val + j, tmp3)]})
+                    instrs.append({"load": [("load", tmp_node_val + j, vtmp3 + j)]})
 
                 instrs.append({"debug": [("vcompare", tmp_node_val, [(round, batch_base + j, "node_val") for j in range(VLEN)])]})
                 # val = myhash(val ^ node_val)
@@ -197,7 +200,7 @@ class KernelBuilder:
                 instrs.append({"valu": [("+", tmp_addr, self.scratch["inp_values_p"], i_batch_const)]})
                 instrs.append({"store": [("vstore", tmp_addr, tmp_val)]})
 
-        # Scalar 
+        # Scalar
         # for round in range(rounds):
         #     for i in range(batch_size):
         #         i_const = self.scratch_const(i)
@@ -240,7 +243,9 @@ class KernelBuilder:
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
+
 BASELINE = 147734
+
 
 def do_kernel_test(
     forest_height: int,
@@ -277,8 +282,7 @@ def do_kernel_test(
             print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
             print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
         assert (
-            machine.mem[inp_values_p : inp_values_p + len(inp.values)]
-            == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
+            machine.mem[inp_values_p : inp_values_p + len(inp.values)] == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
         ), f"Incorrect result on round {i}"
         inp_indices_p = ref_mem[5]
         if prints:
