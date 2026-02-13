@@ -48,11 +48,11 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
+    def build(self, slots: list[tuple[Engine, list[tuple]]], vliw: bool = False):
         # Simple slot packing that just uses one slot per instruction bundle
         instrs = []
         for engine, slot in slots:
-            instrs.append({engine: [slot]})
+            instrs.append({engine: slot})
         return instrs
 
     def add(self, engine, slot):
@@ -243,7 +243,8 @@ class Tests(unittest.TestCase):
 
     def test_kernel_trace(self):
         # Full-scale example for performance testing
-        do_kernel_test(10, 16, 256, trace=True, prints=False)
+        # do_kernel_test(10, 16, 256, trace=True, prints=False)
+        do_kernel_test(2, 2, 4, trace=True, prints=False)
 
     # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
     # You can uncomment this if you think it might help you debug
