@@ -31,6 +31,7 @@ from problem import (
     Tree,
     Input,
     HASH_STAGES,
+    cdiv,
     reference_kernel,
     build_mem_image,
     reference_kernel2,
@@ -87,8 +88,9 @@ class KernelBuilder:
         slots = []
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append({"valu": [(op1, vtmp1, val_hash_addr, self.vscratch_const(val1))]})
-            slots.append({"valu": [(op3, vtmp2, val_hash_addr, self.vscratch_const(val3))]})
+            slots.append(
+                {"valu": [(op1, vtmp1, val_hash_addr, self.vscratch_const(val1)), (op3, vtmp2, val_hash_addr, self.vscratch_const(val3))]}
+            )
             slots.append({"valu": [(op2, val_hash_addr, vtmp1, vtmp2)]})
             slots.append({"debug": [("vcompare", val_hash_addr, [(round, batch_base + j, "hash_stage", hi) for j in range(VLEN)])]})
         return slots
@@ -98,13 +100,8 @@ class KernelBuilder:
         Like reference_kernel2 but building actual instructions.
         Scalar implementation using only scalar ALU and load/store.
         """
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
 
-        vtmp1 = self.alloc_scratch("vtmp1", VLEN)
-        vtmp2 = self.alloc_scratch("vtmp2", VLEN)
-        vtmp3 = self.alloc_scratch("vtmp3", VLEN)
+        tmp1 = self.alloc_scratch(f"tmp1")
 
         # Scratch space addresses
         init_vars = [
@@ -132,6 +129,8 @@ class KernelBuilder:
         vn_nodes = self.alloc_scratch("vn_nodes", VLEN)
         self.add("valu", ("vbroadcast", vn_nodes, self.scratch["n_nodes"]))
 
+
+
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
         # file requires these match up to the reference kernel's yields, but the
@@ -140,111 +139,188 @@ class KernelBuilder:
         # Any debug engine instruction is ignored by the submission simulator
         self.add("debug", ("comment", "Starting loop"))
 
-        body = []  # array of slots
-
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx", VLEN)
-        tmp_val = self.alloc_scratch("tmp_val", VLEN)
-        tmp_node_val = self.alloc_scratch("tmp_node_val", VLEN)
-        tmp_addr = self.alloc_scratch("tmp_addr", VLEN)
-        tmp_addr2 = self.alloc_scratch("tmp_addr2", VLEN)
-
         instrs: list[dict[str, list]] = []
+        for (_, val1, _,_, val3) in HASH_STAGES:
+            self.vscratch_const(val1)
+            self.vscratch_const(val3)
 
+        groups_per_chunk = (SCRATCH_SIZE - self.scratch_ptr) // 70 # 65 + padding
+
+        chunk_vars = [[ self.alloc_scratch(f"vtmp1_{i}", VLEN),
+            self.alloc_scratch(f"vtmp2_{i}", VLEN),
+            self.alloc_scratch(f"vtmp3_{i}", VLEN),
+            self.alloc_scratch(f"tmp_val_{i}", VLEN),
+            self.alloc_scratch(f"tmp_node_val_{i}", VLEN),
+            self.alloc_scratch(f"tmp_idx_{i}", VLEN),
+            self.alloc_scratch(f"tmp_addr_{i}", VLEN),
+            self.alloc_scratch(f"tmp_addr2_{i}", VLEN),
+        ] for i in range(groups_per_chunk)]
+
+        n_groups = batch_size // VLEN
         for round in range(rounds):
-            for i in range(batch_size // 8):
-                batch_base = i * VLEN
-                i_batch_const = self.scratch_const(batch_base)
+            for chunk in range(cdiv(n_groups , groups_per_chunk)):
+                start = chunk * groups_per_chunk
+                to_do = min(n_groups - start, groups_per_chunk)
+                # print(f"chunk {chunk}, start {start}, to_do {to_do}, batches_per_chunk {groups_per_chunk}")
+                batches = []
+                for i in range(to_do):
+                    # print(f"batch: {i + start}")
+                    batch_instrs = self.build_group(start + i, round, zeros, ones, twos, vn_nodes, *chunk_vars[i])
+                    batches.append(batch_instrs)
+                instrs.extend(pack(batches))
 
-                # idx = mem[inp_indices_p + i]
-                # val = mem[inp_values_p + i]
-                instrs.append(
-                    {
-                        "alu": [
-                            ("+", tmp_addr, self.scratch["inp_indices_p"], i_batch_const),
-                            ("+", tmp_addr2, self.scratch["inp_values_p"], i_batch_const),
-                        ]
-                    }
-                )
-                instrs.append({"load": [("vload", tmp_idx, tmp_addr), ("vload", tmp_val, tmp_addr2)]})
-                instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "idx") for j in range(VLEN)])]})
-                instrs.append({"debug": [("vcompare", tmp_val, [(round, batch_base + j, "val") for j in range(VLEN)])]})
 
-                # node_val = mem[forest_values_p + idx]
-                # Bad scalar loads and counter incrs to handle non-contiguous value loads
-
-                instrs.append({"alu": [("+", vtmp3 + j, self.scratch["forest_values_p"], tmp_idx + j) for j in range(8)]})
-                for j in range(8):
-                    instrs.append({"load": [("load", tmp_node_val + j, vtmp3 + j)]})
-
-                instrs.append({"debug": [("vcompare", tmp_node_val, [(round, batch_base + j, "node_val") for j in range(VLEN)])]})
-                # val = myhash(val ^ node_val)
-                instrs.append({"valu": [("^", tmp_val, tmp_val, tmp_node_val)]})
-                instrs.extend(self.build_hash(tmp_val, vtmp1, vtmp2, round, batch_base))
-                instrs.append({"debug": [("vcompare", tmp_val, [(round, batch_base + j, "hashed_val") for j in range(VLEN)])]})
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                instrs.append({"valu": [("%", tmp1, tmp_val, twos)]})
-                instrs.append({"valu": [("==", tmp1, tmp1, zeros)]})
-                instrs.append({"flow": [("vselect", tmp3, tmp1, ones, twos)]})
-                instrs.append({"valu": [("*", tmp_idx, tmp_idx, twos)]})
-                instrs.append({"valu": [("+", tmp_idx, tmp_idx, tmp3)]})
-                instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "next_idx") for j in range(VLEN)])]})
-                # idx = 0 if idx >= n_nodes else idx
-                instrs.append({"valu": [("<", tmp1, tmp_idx, vn_nodes)]})
-                instrs.append({"flow": [("vselect", tmp_idx, tmp1, tmp_idx, zeros)]})
-                instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "wrapped_idx") for j in range(VLEN)])]})
-                # mem[inp_indices_p + i] = idx
-                instrs.append({"valu": [("+", tmp_addr, self.scratch["inp_indices_p"], i_batch_const)]})
-                instrs.append({"store": [("vstore", tmp_addr, tmp_idx)]})
-                # mem[inp_values_p + i] = val
-                instrs.append({"valu": [("+", tmp_addr, self.scratch["inp_values_p"], i_batch_const)]})
-                instrs.append({"store": [("vstore", tmp_addr, tmp_val)]})
-
-        # Scalar
-        # for round in range(rounds):
-        #     for i in range(batch_size):
-        #         i_const = self.scratch_const(i)
-        #         # idx = mem[inp_indices_p + i]
-        #         body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-        #         body.append(("load", ("load", tmp_idx, tmp_addr)))
-        #         body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-        #         # val = mem[inp_values_p + i]
-        #         body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-        #         body.append(("load", ("load", tmp_val, tmp_addr)))
-        #         body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-        #         # node_val = mem[forest_values_p + idx]
-        #         body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-        #         body.append(("load", ("load", tmp_node_val, tmp_addr)))
-        #         body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-        #         # val = myhash(val ^ node_val)
-        #         body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-        #         body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-        #         body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-        #         # idx = 2*idx + (1 if val % 2 == 0 else 2)
-        #         body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-        #         body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-        #         body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-        #         body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-        #         body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-        #         body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-        #         # idx = 0 if idx >= n_nodes else idx
-        #         body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-        #         body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-        #         body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-        #         # mem[inp_indices_p + i] = idx
-        #         body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-        #         body.append(("store", ("store", tmp_addr, tmp_idx)))
-        #         # mem[inp_values_p + i] = val
-        #         body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-        #         body.append(("store", ("store", tmp_addr, tmp_val)))
-
-        # body_instrs = self.build(body)
         self.instrs.extend(instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
+    def merge_instrs(self, old: list[dict[str, list[tuple]]], new: list[dict[str, list[tuple]]]):
+        i = 0
+        for n in new:
+            while sum(len(ops) for ops in n.values()) > 0:
+                o = old[i]
+                o_full, n_empty = self.merge(o, n)
+                if o_full:
+                    i += 1
 
-BASELINE = 147734
+
+
+    def build_group(self, batch: int, round, zeros, ones, twos, vn_nodes, vtmp1, vtmp2, vtmp3, tmp_val, tmp_node_val, tmp_idx, tmp_addr, tmp_addr2):
+        instrs = []
+
+        batch_base = batch * VLEN
+        i_batch_const = self.scratch_const(batch_base)
+
+        # idx = mem[inp_indices_p + i]
+        # val = mem[inp_values_p + i]
+        instrs.append(
+            {
+                "alu": [
+                    ("+", tmp_addr, self.scratch["inp_indices_p"], i_batch_const),
+                    ("+", tmp_addr2, self.scratch["inp_values_p"], i_batch_const),
+                ]
+            }
+        )
+        instrs.append({"load": [("vload", tmp_idx, tmp_addr), ("vload", tmp_val, tmp_addr2)]})
+        instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "idx") for j in range(VLEN)])]})
+        instrs.append({"debug": [("vcompare", tmp_val, [(round, batch_base + j, "val") for j in range(VLEN)])]})
+
+        # node_val = mem[forest_values_p + idx]
+        # Bad scalar loads and counter incrs to handle non-contiguous value loads
+
+        instrs.append({"alu": [("+", vtmp3 + j, self.scratch["forest_values_p"], tmp_idx + j) for j in range(8)]})
+        for j in range(0, 8, 2):
+            instrs.append({"load": [("load", tmp_node_val + j, vtmp3 + j), ("load", tmp_node_val + j + 1, vtmp3 + j + 1)]})
+
+        instrs.append({"debug": [("vcompare", tmp_node_val, [(round, batch_base + j, "node_val") for j in range(VLEN)])]})
+
+        # val = myhash(val ^ node_val)
+        instrs.append({"valu": [("^", tmp_val, tmp_val, tmp_node_val)]})
+        instrs.extend(self.build_hash(tmp_val, vtmp1, vtmp2, round, batch_base))
+
+        instrs.append({"debug": [("vcompare", tmp_val, [(round, batch_base + j, "hashed_val") for j in range(VLEN)])]})
+
+        # idx = 2*idx + (1 if val % 2 == 0 else 2)
+        instrs.append({"valu": [("%", vtmp1, tmp_val, twos)]})
+        instrs.append({"valu": [("==", vtmp1, vtmp1, zeros)]})
+        instrs.append({"flow": [("vselect", vtmp3, vtmp1, ones, twos)]})
+        instrs.append({"valu": [("*", tmp_idx, tmp_idx, twos)]})
+        instrs.append({"valu": [("+", tmp_idx, tmp_idx, vtmp3)]})
+
+        instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "next_idx") for j in range(VLEN)])]})
+
+        # idx = 0 if idx >= n_nodes else idx
+        instrs.append({"valu": [("<", vtmp1, tmp_idx, vn_nodes)]})
+        instrs.append({"flow": [("vselect", tmp_idx, vtmp1, tmp_idx, zeros)]})
+
+        instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "wrapped_idx") for j in range(VLEN)])]})
+
+        # mem[inp_indices_p + i] = idx
+        # mem[inp_values_p + i] = val
+        instrs.append(
+            {
+                "valu": [
+                    ("+", tmp_addr, self.scratch["inp_indices_p"], i_batch_const),
+                    ("+", tmp_addr2, self.scratch["inp_values_p"], i_batch_const),
+                ]
+            }
+        )
+        instrs.append({"store": [("vstore", tmp_addr, tmp_idx), ("vstore", tmp_addr2, tmp_val)]})
+        return instrs
+
+def pack(batches: list[list[dict]]):
+    assert len(batches) > 0
+
+    packed = [{}]
+    idx = -1
+    for batch in batches:
+        drain_list(packed, batch)
+    return packed
+
+def drain_list(into_list: list[dict[str, list]], from_list: list[dict[str,list[tuple]]]):
+    if len(into_list) == 0:
+        into_list.append({})
+    idx = -1
+    for from_ in from_list:
+        idx = next_with_slots(into_list, idx)
+        drain(into_list[idx], from_)
+        while not instr_empty(from_):
+            idx = next_with_slots(into_list, idx)
+            drain(into_list[idx], from_)
+            
+
+
+
+def next_with_slots(l: list[dict], i:int) -> int:
+    for i in range(i+1, len(l)):
+        if not instr_full(l[i]):
+            return i
+    l.append({})
+    return len(l) -1
+
+
+def instr_empty(instr: dict) -> bool: 
+    if len(instr) == 0:
+        return True
+    for ops in instr.values():
+        if len(ops) == 0:
+            return True
+    return False
+
+
+def instr_full(instr: dict) -> bool: 
+    for slot, limit in SLOT_LIMITS.items():
+        if slot not in instr:
+            return False
+        if len(instr[slot]) < limit:
+            return False
+    return True
+
+
+def drain(into: dict[str, list[tuple]], from_: dict[str,list[tuple]]):
+    from_empty = True
+    for slot, limit in SLOT_LIMITS.items():
+        if slot not in from_:
+            continue
+        if slot not in into:
+            into[slot] = []
+        available = limit - len(into[slot]) 
+
+        assert available >= 0, "instr packed beyond limit"
+        if available == 0:
+            continue
+        if available >= len(from_[slot]):
+            into[slot].extend(from_[slot])
+            del from_[slot]
+        else:
+            into[slot].extend(from_[slot][:available])
+            from_[slot] = from_[slot][available:]
+            from_empty = False
+    instr_full = all(( len(ops) == SLOT_LIMITS[slot] for slot, ops in into.items()))
+    return (instr_full, from_empty)
+
+
+BASELINE = 147_734
 
 
 def do_kernel_test(
@@ -297,6 +373,34 @@ def do_kernel_test(
 
 
 class Tests(unittest.TestCase):
+    def test_pack(self):
+        vtmp1, tmp_val, twos, zeros, ones, vtmp3, tmp_idx = 1,2,3,4,5,6,7
+        import copy 
+        instrs = []
+        instrs.append({"load": [("%", vtmp1, tmp_val, twos)]})
+        instrs.append({"valu": [("==", vtmp1, vtmp1, zeros)]})
+        instrs.append({"valu": [("!=", vtmp1, vtmp1, zeros)]})
+        # instrs.append({"valu": [("*", tmp_idx, tmp_idx, twos)]})
+        # instrs.append({"valu": [("+", tmp_idx, tmp_idx, vtmp3)]})
+
+        batches = [copy.deepcopy(instrs) for i in range(3)]
+
+        packed = pack(batches)
+        for j, instr in enumerate(packed):
+            print(f"\nInstr {j}")
+            for name,slot in instr.items():
+                print(f"{name}: {len(slot)}")
+                print(slot)
+
+
+        # packed = pack(batches)
+        # print("=== Done ===")
+        # for instr in packed:
+        #     print(instr)
+        #     print([(name, len(slot)) for name,slot in instr.items()])
+
+
+
     def test_ref_kernels(self):
         """
         Test the reference kernels against each other
@@ -314,8 +418,8 @@ class Tests(unittest.TestCase):
 
     def test_kernel_trace(self):
         # Full-scale example for performance testing
-        # do_kernel_test(10, 16, 256, trace=True, prints=False)
-        do_kernel_test(2, 1, 8, trace=True, prints=False)
+        do_kernel_test(10, 16, 256, trace=True, prints=False)
+        # do_kernel_test(2, 2, 64, trace=True, prints=False)
 
     # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
     # You can uncomment this if you think it might help you debug
