@@ -297,8 +297,9 @@ class KernelBuilder:
         instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "next_idx") for j in range(VLEN)])]})
 
         # idx = 0 if idx >= n_nodes else idx
-        instrs.append({"valu": [("<", vtmp1, tmp_idx, vn_nodes)]})
-        instrs.append({"flow": [("vselect", tmp_idx, vtmp1, tmp_idx, zeros)]})
+        if round == 10:
+            instrs.append({"valu": [("+", tmp_idx, zeros, zeros)]})
+        # instrs.append({"flow": [("vselect", tmp_idx, vtmp1, tmp_idx, zeros)]})
 
         instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "wrapped_idx") for j in range(VLEN)])]})
 
