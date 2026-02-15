@@ -380,7 +380,7 @@ class Machine:
                             f"{res} != {ref} for {keys} at pc={core.pc} loc={loc}"
                         )
                 continue
-            assert len(slots) <= SLOT_LIMITS[name]
+            assert len(slots) <= SLOT_LIMITS[name], (name, slots)
             for i, slot in enumerate(slots):
                 if self.trace is not None:
                     self.trace_slot(core, slot, name, i)

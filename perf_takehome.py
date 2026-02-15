@@ -188,10 +188,15 @@ class KernelBuilder:
             self.vscratch_const(val1)
             self.vscratch_const(val3)
 
+        def dbg(x):
+            print(x)
+            return x
+
         short_forest_vals = self.alloc_scratch("short_forest_vals", VLEN)
-        short_forest_vec_vals = self.alloc_scratch("short_forest_vec_vals", VLEN * 3)
+        short_forest_vec_vals = self.alloc_scratch("short_forest_vec_vals", VLEN * 8)
         instrs.append({"load": [("vload", short_forest_vals, self.scratch["forest_values_p"])]})
-        instrs.append({"valu": [("vbroadcast", short_forest_vec_vals + i * VLEN, short_forest_vals + i) for i in range(3)]})
+        instrs.append({"valu": dbg([("vbroadcast", short_forest_vec_vals + i * VLEN, short_forest_vals + i) for i in range(6)])})
+        instrs.append({"valu": dbg([("vbroadcast", short_forest_vec_vals + i * VLEN, short_forest_vals + i) for i in range(6,8)])})
 
         groups_per_chunk = (SCRATCH_SIZE - self.scratch_ptr) // 70 # 65 + padding
         print(f"groups_per_chunk {groups_per_chunk}")
@@ -223,15 +228,6 @@ class KernelBuilder:
         self.instrs.extend(instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
-
-    def merge_instrs(self, old: list[dict[str, list[tuple]]], new: list[dict[str, list[tuple]]]):
-        i = 0
-        for n in new:
-            while sum(len(ops) for ops in n.values()) > 0:
-                o = old[i]
-                o_full, n_empty = self.merge(o, n)
-                if o_full:
-                    i += 1
 
     def build_group_load(
         self, batch: int, round, 
@@ -311,6 +307,56 @@ class KernelBuilder:
                 ("-", diff, vf2, vf1)
             ]})
             instrs.append({"valu": [("multiply_add", tmp_node_val, diff, offset, vf1)]})
+        elif round % (self.forest_height + 1) == 2:
+            vvals = self.scratch["short_forest_vec_vals"]
+            vec_3 = self.vscratch_const(3, "threes")
+
+            vf3 = vvals + VLEN * 3
+            vf4 = vvals + VLEN * 4
+            vf5 = vvals + VLEN * 5
+            vf6 = vvals + VLEN * 6
+
+            offset = vtmp1
+            bit0   = vtmp2
+            bit1   = vtmp3
+            d01    = tmp_addr      # reuse
+            d23    = tmp_addr2     # reuse
+
+            # Cycle 1: offset + level-1 diffs [3 valu]
+            if batch % 2 == 0:
+                instrs.append({"valu": [
+                    ("-", offset, tmp_idx, vec_3), 
+                    ("-", d01, vf4, vf3),
+                    ("-", d23, vf6, vf5),
+                ]})
+            else:
+                instrs.append({
+                    "valu": [("-", offset, tmp_idx, vec_3), ("-", d01, vf4, vf3)],
+                    "alu": [("-", d23 + j, vf6 + j, vf5 + j) for j in range(VLEN)]
+                })
+
+            # Cycle 2: bit extraction [2 valu]
+            instrs.append({"valu": [
+                ("&",  bit0, offset, ones),
+                (">>", bit1, offset, ones),   # max val 1, no mask needed
+            ]})
+
+            # Cycle 3: level-1 selects [2 valu]
+            instrs.append({"valu": [
+                ("multiply_add", d01, d01, bit0, vf3),    # r01
+                ("multiply_add", d23, d23, bit0, vf5),    # r23
+            ]})
+
+            # Cycle 4: level-2 diff [1 valu]
+            da = offset  # dead, reuse
+            instrs.append({"valu": [
+                ("-", da, d23, d01),
+            ]})
+
+            # Cycle 5: level-2 select [1 valu]
+            instrs.append({"valu": [
+                ("multiply_add", tmp_node_val, da, bit1, d01),
+            ]})
         else:
             # Bad scalar loads and counter incrs to handle non-contiguous value loads
             instrs.append({"alu": [("+", vtmp3 + j, self.scratch["forest_values_p"], tmp_idx + j) for j in range(8)]})
@@ -346,22 +392,42 @@ def pack(batches: list[list[dict]]):
 
     packed = [{}]
     idx = -1
-    for batch in batches:
+    for i,batch in enumerate(batches):
+        if i == 0:
+            drain_list(packed, batch, debug=True)
         drain_list(packed, batch)
     return packed
 
-def drain_list(into_list: list[dict[str, list]], from_list: list[dict[str,list[tuple]]]):
+def drain_list(into_list: list[dict[str, list]], from_list: list[dict[str,list[tuple]]], debug = False):
+    # if debug:
+    #     print_instrs(from_list[:50], no_debug=False)
+    from_list = pack_debug(from_list)
+    # if debug:
+    #     print_instrs(from_list[:50], no_debug=False)
     if len(into_list) == 0:
         into_list.append({})
     idx = -1
+    # if debug:
+    #     print_instrs(from_list[:50])
     for from_ in from_list:
         idx = next_with_slots(into_list, idx)
         drain(into_list[idx], from_)
         while not instr_empty(from_):
             idx = next_with_slots(into_list, idx)
             drain(into_list[idx], from_)
+    # if debug:
+    #     print_instrs(into_list[:50])
             
 
+def print_instrs(xs: list[dict], no_debug = True):
+    print("")
+    out = []
+    for x in xs:
+        x = {name:len(slots) for name, slots in x.items()}
+        if "debug" in x and no_debug:
+            del x["debug"]
+        out.append(x)
+    print(out)
 
 
 def next_with_slots(l: list[dict], i:int) -> int:
@@ -388,6 +454,22 @@ def instr_full(instr: dict) -> bool:
         if len(instr[slot]) < limit:
             return False
     return True
+
+def pack_debug(instrs: list[dict]):
+    no_debug = []
+    dbgs = []
+    for instr in instrs:
+        if len(instr) == 1 and "debug" in instr:
+            dbgs.extend(instr["debug"])
+        else:
+            if len(dbgs) > 0:
+                if "debug" not in instr:
+                    instr["debug"] = dbgs 
+                else: 
+                    instr["debug"].extend(dbgs)
+                dbgs = []
+            no_debug.append(instr)
+    return no_debug
 
 
 def drain(into: dict[str, list[tuple]], from_: dict[str,list[tuple]]):
