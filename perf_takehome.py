@@ -284,6 +284,7 @@ class KernelBuilder:
         self, batch: int, round, 
         vtmp1, vtmp2, vtmp3, tmp_val, tmp_node_val, tmp_idx, tmp_addr, tmp_addr2
     ) -> list[dict]:
+        # 292 valu per batch
         instrs = []
 
         batch_base = batch * VLEN
@@ -294,9 +295,11 @@ class KernelBuilder:
         # node_val = mem[forest_values_p + idx]
 
         if round % (self.forest_height + 1) == 0:
+            # 1 valu (can be 0 for round 0)
             vvals = self.scratch["short_forest_vec_vals"]
             instrs.append({"valu": [("+", tmp_node_val, zeros, vvals)]})
         elif round % (self.forest_height + 1) == 1:
+            # 3 valu
             vvals = self.scratch["short_forest_vec_vals"]
             offset = vtmp1
             diff = vtmp2
@@ -308,6 +311,7 @@ class KernelBuilder:
             ]})
             instrs.append({"valu": [("multiply_add", tmp_node_val, diff, offset, vf1)]})
         elif round % (self.forest_height + 1) == 2:
+            # 9 valu
             vvals = self.scratch["short_forest_vec_vals"]
             vec_3 = self.vscratch_const(3, "threes")
 
@@ -358,6 +362,7 @@ class KernelBuilder:
                 ("multiply_add", tmp_node_val, da, bit1, d01),
             ]})
         else:
+            # 8 alu (1 valu equiv)
             # Bad scalar loads and counter incrs to handle non-contiguous value loads
             instrs.append({"alu": [("+", vtmp3 + j, self.scratch["forest_values_p"], tmp_idx + j) for j in range(8)]})
             for j in range(0, 8, 2):
@@ -366,6 +371,7 @@ class KernelBuilder:
         instrs.append({"debug": [("vcompare", tmp_node_val, [(round, batch_base + j, "node_val") for j in range(VLEN)])]})
 
         # val = myhash(val ^ node_val)
+        # 13 valu
         instrs.append({"valu": [("^", tmp_val, tmp_val, tmp_node_val)]})
         instrs.extend(self.build_hash(tmp_val, vtmp1, vtmp2, round, batch_base))
 
@@ -373,6 +379,7 @@ class KernelBuilder:
 
         # idx = 2*idx + (1 if val % 2 == 0 else 2)
         #     = 2*idx + 1 + (val & 1)
+        # 3 valudf
         instrs.append({"valu": [("&", vtmp1, tmp_val, ones)]})
         instrs.append({"valu": [("+", vtmp1, vtmp1, ones)]})
         instrs.append({"valu": [("multiply_add", tmp_idx, tmp_idx, twos, vtmp1)]})
