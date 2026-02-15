@@ -199,18 +199,20 @@ class KernelBuilder:
         ] for i in range(groups_per_chunk)]
 
         n_groups = batch_size // VLEN
+        groups = defaultdict(list)
         for chunk in range(cdiv(n_groups , groups_per_chunk)):
             start = chunk * groups_per_chunk
             to_do = min(n_groups - start, groups_per_chunk)
-            groups = []
             for i in range(to_do):
                 group_instrs = self.build_group_load(start + i, 0, *chunk_vars[i])
                 for round in range(rounds):
                     g = self.build_group(start + i, round, *chunk_vars[i])
                     group_instrs.extend(g)
                 group_instrs.extend(self.build_group_store(start + i, *chunk_vars[i]))
-                groups.append(group_instrs)
-            instrs.extend(pack(groups))
+                groups[i].extend(group_instrs)
+        instrs.extend(pack(groups.values()))
+        
+
 
 
         self.instrs.extend(instrs)
