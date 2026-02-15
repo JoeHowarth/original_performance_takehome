@@ -187,9 +187,11 @@ class KernelBuilder:
             to_do = min(n_groups - start, groups_per_chunk)
             groups = []
             for i in range(to_do):
-                group_instrs = []
+                group_instrs = self.build_group_load(start + i, 0, *chunk_vars[i])
                 for round in range(rounds):
-                    group_instrs.extend(self.build_group(start + i, round, zeros, ones, twos, vn_nodes, *chunk_vars[i]))
+                    g = self.build_group(start + i, round, *chunk_vars[i])
+                    group_instrs.extend(g)
+                group_instrs.extend(self.build_group_store(start + i, *chunk_vars[i]))
                 groups.append(group_instrs)
             instrs.extend(pack(groups))
 
@@ -207,10 +209,8 @@ class KernelBuilder:
                 if o_full:
                     i += 1
 
-
-
-    def build_group(
-        self, batch: int, round, zeros, ones, twos, vn_nodes, 
+    def build_group_load(
+        self, batch: int, round, 
         vtmp1, vtmp2, vtmp3, tmp_val, tmp_node_val, tmp_idx, tmp_addr, tmp_addr2
     ) -> list[dict]:
         instrs = []
@@ -231,6 +231,46 @@ class KernelBuilder:
         instrs.append({"load": [("vload", tmp_idx, tmp_addr), ("vload", tmp_val, tmp_addr2)]})
         instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "idx") for j in range(VLEN)])]})
         instrs.append({"debug": [("vcompare", tmp_val, [(round, batch_base + j, "val") for j in range(VLEN)])]})
+
+        return instrs
+
+    def build_group_store(
+        self, batch: int,  
+        vtmp1, vtmp2, vtmp3, tmp_val, tmp_node_val, tmp_idx, tmp_addr, tmp_addr2
+    ) -> list[dict]:
+        instrs = []
+
+        batch_base = batch * VLEN
+        i_batch_const = self.scratch_const(batch_base)
+
+        # mem[inp_indices_p + i] = idx
+        # mem[inp_values_p + i] = val
+        instrs.append(
+            {
+                "valu": [
+                    ("+", tmp_addr, self.scratch["inp_indices_p"], i_batch_const),
+                    ("+", tmp_addr2, self.scratch["inp_values_p"], i_batch_const),
+                ]
+            }
+        )
+        instrs.append({"store": [("vstore", tmp_addr, tmp_idx), ("vstore", tmp_addr2, tmp_val)]})
+
+        return instrs
+
+
+    def build_group(
+        self, batch: int, round, 
+        vtmp1, vtmp2, vtmp3, tmp_val, tmp_node_val, tmp_idx, tmp_addr, tmp_addr2
+    ) -> list[dict]:
+        instrs = []
+
+        batch_base = batch * VLEN
+        i_batch_const = self.scratch_const(batch_base)
+        zeros = self.vscratch_const(0, "zeros")
+        ones = self.vscratch_const(1, "ones")
+        twos = self.vscratch_const(2, "twos")
+        vn_nodes = self.scratch["vn_nodes"]
+
 
         # node_val = mem[forest_values_p + idx]
         # Bad scalar loads and counter incrs to handle non-contiguous value loads
@@ -262,17 +302,6 @@ class KernelBuilder:
 
         instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "wrapped_idx") for j in range(VLEN)])]})
 
-        # mem[inp_indices_p + i] = idx
-        # mem[inp_values_p + i] = val
-        instrs.append(
-            {
-                "valu": [
-                    ("+", tmp_addr, self.scratch["inp_indices_p"], i_batch_const),
-                    ("+", tmp_addr2, self.scratch["inp_values_p"], i_batch_const),
-                ]
-            }
-        )
-        instrs.append({"store": [("vstore", tmp_addr, tmp_idx), ("vstore", tmp_addr2, tmp_val)]})
         return instrs
 
 def pack(batches: list[list[dict]]):
