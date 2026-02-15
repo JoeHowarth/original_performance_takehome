@@ -134,7 +134,7 @@ class KernelBuilder:
                 # else:
                 #     slots.append({"valu": [(op2, val_hash_addr, vtmp1, vtmp2)]})
                 slots.append({"valu": [(op2, val_hash_addr, vtmp1, vtmp2)]})
-            slots.append({"debug": [("vcompare", val_hash_addr, [(round, batch_base + j, "hash_stage", hi) for j in range(VLEN)])]})
+            # slots.append({"debug": [("vcompare", val_hash_addr, [(round, batch_base + j, "hash_stage", hi) for j in range(VLEN)])]})
         return slots
 
     def build_kernel(self, forest_height: int, n_nodes: int, batch_size: int, rounds: int):
@@ -163,13 +163,13 @@ class KernelBuilder:
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
 
-        # zero_const = self.scratch_const(0)
-        # one_const = self.scratch_const(1)
-        # two_const = self.scratch_const(2)
+        zero_const = self.scratch_const(0)
+        one_const = self.scratch_const(1)
+        two_const = self.scratch_const(2)
 
-        # zeros = self.vscratch_const(0, "zeros")
-        # ones = self.vscratch_const(1, "ones")
-        # twos = self.vscratch_const(2, "twos")
+        zeros = self.vscratch_const(0, "zeros")
+        ones = self.vscratch_const(1, "ones")
+        twos = self.vscratch_const(2, "twos")
         vn_nodes = self.alloc_scratch("vn_nodes", VLEN)
         self.add("valu", ("vbroadcast", vn_nodes, self.scratch["n_nodes"]))
 
@@ -223,7 +223,8 @@ class KernelBuilder:
                     group_instrs.extend(g)
                 group_instrs.extend(self.build_group_store(start + i, *chunk_vars[i]))
                 groups[i].extend(group_instrs)
-        instrs.extend(pack(groups.values()))
+        # instrs.extend(pack(groups.values()))
+        instrs.extend(cross_packer(list(groups.values())))
         
         self.instrs.extend(instrs)
         # Required to match with the yield in reference_kernel2
@@ -250,8 +251,8 @@ class KernelBuilder:
             }
         )
         instrs.append({"load": [("vload", tmp_val, tmp_addr2)], "valu": [("vbroadcast", tmp_idx, zero)]})
-        instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "idx") for j in range(VLEN)])]})
-        instrs.append({"debug": [("vcompare", tmp_val, [(round, batch_base + j, "val") for j in range(VLEN)])]})
+        # instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "idx") for j in range(VLEN)])]})
+        # instrs.append({"debug": [("vcompare", tmp_val, [(round, batch_base + j, "val") for j in range(VLEN)])]})
 
         return instrs
 
@@ -368,14 +369,14 @@ class KernelBuilder:
             for j in range(0, 8, 2):
                 instrs.append({"load": [("load", tmp_node_val + j, vtmp3 + j), ("load", tmp_node_val + j + 1, vtmp3 + j + 1)]})
 
-        instrs.append({"debug": [("vcompare", tmp_node_val, [(round, batch_base + j, "node_val") for j in range(VLEN)])]})
+        # instrs.append({"debug": [("vcompare", tmp_node_val, [(round, batch_base + j, "node_val") for j in range(VLEN)])]})
 
         # val = myhash(val ^ node_val)
         # 13 valu
         instrs.append({"valu": [("^", tmp_val, tmp_val, tmp_node_val)]})
         instrs.extend(self.build_hash(tmp_val, vtmp1, vtmp2, round, batch_base))
 
-        instrs.append({"debug": [("vcompare", tmp_val, [(round, batch_base + j, "hashed_val") for j in range(VLEN)])]})
+        # instrs.append({"debug": [("vcompare", tmp_val, [(round, batch_base + j, "hashed_val") for j in range(VLEN)])]})
 
         # idx = 2*idx + (1 if val % 2 == 0 else 2)
         #     = 2*idx + 1 + (val & 1)
@@ -384,15 +385,102 @@ class KernelBuilder:
         instrs.append({"valu": [("+", vtmp1, vtmp1, ones)]})
         instrs.append({"valu": [("multiply_add", tmp_idx, tmp_idx, twos, vtmp1)]})
 
-        instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "next_idx") for j in range(VLEN)])]})
+        # instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "next_idx") for j in range(VLEN)])]})
 
         # idx = 0 if idx >= n_nodes else idx
         if round == 10:
             instrs.append({"valu": [("+", tmp_idx, zeros, zeros)]})
 
-        instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "wrapped_idx") for j in range(VLEN)])]})
+        # instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "wrapped_idx") for j in range(VLEN)])]})
 
         return instrs
+
+def head_has_work(instr: dict) -> bool:
+    return any(instr.get(engine) for engine in SLOT_LIMITS.keys())
+
+def trim_stream(stream: list[dict]) -> None:
+    while stream and not head_has_work(stream[0]):
+        stream.pop(0)
+
+def pick_frontier_with_engine(
+    frontier: list[tuple[int, dict]], start: int, engine: str
+) -> int | None:
+    n = len(frontier)
+    for off in range(n):
+        i = (start + off) % n
+        _, head = frontier[i]
+        if head.get(engine):
+            return i
+    return None
+
+def cross_packer(streams: list[list[dict]]):
+    packed = []
+    engine_order = ("load", "valu", "alu", "flow", "store", "debug")
+    streams = [pack_debug(s) for s in streams if s]
+    # rr = 0
+
+    while True:
+        streams = [s for s in streams if s]
+        for s in streams:
+            trim_stream(s)
+        streams = [s for s in streams if s]
+        if not streams:
+            break
+
+        # Freeze frontier for this cycle: max 1 head per stream.
+        frontier = [(si, streams[si][0]) for si in range(len(streams))]
+
+        instr = defaultdict(list)
+        progressed = True
+        while progressed:
+            progressed = False
+            rr = 0
+            for engine in engine_order:
+                goal = SLOT_LIMITS[engine] - len(instr[engine])
+                while goal > 0:
+                    fi = pick_frontier_with_engine(frontier, rr, engine)
+                    if fi is None:
+                        break
+
+                    _, head = frontier[fi]
+                    slots = head[engine]
+                    take = min(goal, len(slots))
+
+                    instr[engine].extend(slots[:take])
+                    del slots[:take]
+                    if not slots:
+                        head.pop(engine, None)
+
+                    rr = (fi + 1) % len(frontier)
+                    goal -= take
+                    progressed = True
+
+        packed.append({e: ops for e, ops in instr.items() if ops})
+
+        # Advance at most one head per stream after the cycle.
+        for si, head in frontier:
+            if not head:
+                streams[si].pop(0)
+
+    return packed
+
+    streams = remove_empty_lists(streams)
+    while len(streams) > 0:
+        instr = mk()
+        remaining = SLOT_LIMITS.copy()
+        del remaining["debug"]
+        # pull slots until full
+        while not instr_full(instr):
+            for elem in streams:
+                if pres("load", elem):
+                    instr["load"].append()
+
+
+
+    return packed
+
+def remove_empty_lists(lists: list[list]) -> list[list]:
+    return list(filter(lambda x: len(x) != 0, lists))
 
 def pack(batches: list[list[dict]]):
     assert len(batches) > 0
