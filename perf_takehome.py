@@ -143,6 +143,8 @@ class KernelBuilder:
         Scalar implementation using only scalar ALU and load/store.
         """
 
+        self.forest_height = forest_height
+
         tmp1 = self.alloc_scratch(f"tmp1")
 
         # Scratch space addresses
@@ -161,13 +163,13 @@ class KernelBuilder:
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        # zero_const = self.scratch_const(0)
+        # one_const = self.scratch_const(1)
+        # two_const = self.scratch_const(2)
 
-        zeros = self.vscratch_const(0, "zeros")
-        ones = self.vscratch_const(1, "ones")
-        twos = self.vscratch_const(2, "twos")
+        # zeros = self.vscratch_const(0, "zeros")
+        # ones = self.vscratch_const(1, "ones")
+        # twos = self.vscratch_const(2, "twos")
         vn_nodes = self.alloc_scratch("vn_nodes", VLEN)
         self.add("valu", ("vbroadcast", vn_nodes, self.scratch["n_nodes"]))
 
@@ -186,7 +188,13 @@ class KernelBuilder:
             self.vscratch_const(val1)
             self.vscratch_const(val3)
 
+        short_forest_vals = self.alloc_scratch("short_forest_vals", VLEN)
+        short_forest_vec_vals = self.alloc_scratch("short_forest_vec_vals", VLEN * 3)
+        instrs.append({"load": [("vload", short_forest_vals, self.scratch["forest_values_p"])]})
+        instrs.append({"valu": [("vbroadcast", short_forest_vec_vals + i * VLEN, short_forest_vals + i) for i in range(3)]})
+
         groups_per_chunk = (SCRATCH_SIZE - self.scratch_ptr) // 70 # 65 + padding
+        print(f"groups_per_chunk {groups_per_chunk}")
 
         chunk_vars = [[ self.alloc_scratch(f"vtmp1_{i}", VLEN),
             self.alloc_scratch(f"vtmp2_{i}", VLEN),
@@ -233,18 +241,19 @@ class KernelBuilder:
 
         batch_base = batch * VLEN
         i_batch_const = self.scratch_const(batch_base)
+        zero = self.scratch_const(0, "zero")
 
         # idx = mem[inp_indices_p + i]
         # val = mem[inp_values_p + i]
         instrs.append(
             {
                 "alu": [
-                    ("+", tmp_addr, self.scratch["inp_indices_p"], i_batch_const),
+                    # ("+", tmp_addr, self.scratch["inp_indices_p"], i_batch_const),
                     ("+", tmp_addr2, self.scratch["inp_values_p"], i_batch_const),
                 ]
             }
         )
-        instrs.append({"load": [("vload", tmp_idx, tmp_addr), ("vload", tmp_val, tmp_addr2)]})
+        instrs.append({"load": [("vload", tmp_val, tmp_addr2)], "valu": [("vbroadcast", tmp_idx, zero)]})
         instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "idx") for j in range(VLEN)])]})
         instrs.append({"debug": [("vcompare", tmp_val, [(round, batch_base + j, "val") for j in range(VLEN)])]})
 
@@ -269,7 +278,8 @@ class KernelBuilder:
                 ]
             }
         )
-        instrs.append({"store": [("vstore", tmp_addr, tmp_idx), ("vstore", tmp_addr2, tmp_val)]})
+        instrs.append({"store": [("vstore", tmp_addr2, tmp_val)]})
+        # instrs.append({"store": [("vstore", tmp_addr, tmp_idx), ("vstore", tmp_addr2, tmp_val)]})
 
         return instrs
 
@@ -281,19 +291,31 @@ class KernelBuilder:
         instrs = []
 
         batch_base = batch * VLEN
-        i_batch_const = self.scratch_const(batch_base)
         zeros = self.vscratch_const(0, "zeros")
         ones = self.vscratch_const(1, "ones")
         twos = self.vscratch_const(2, "twos")
-        vn_nodes = self.scratch["vn_nodes"]
-
 
         # node_val = mem[forest_values_p + idx]
-        # Bad scalar loads and counter incrs to handle non-contiguous value loads
 
-        instrs.append({"alu": [("+", vtmp3 + j, self.scratch["forest_values_p"], tmp_idx + j) for j in range(8)]})
-        for j in range(0, 8, 2):
-            instrs.append({"load": [("load", tmp_node_val + j, vtmp3 + j), ("load", tmp_node_val + j + 1, vtmp3 + j + 1)]})
+        if round % (self.forest_height + 1) == 0:
+            vvals = self.scratch["short_forest_vec_vals"]
+            instrs.append({"valu": [("+", tmp_node_val, zeros, vvals)]})
+        elif round % (self.forest_height + 1) == 1:
+            vvals = self.scratch["short_forest_vec_vals"]
+            offset = vtmp1
+            diff = vtmp2
+            vf1 = vvals + VLEN * 1
+            vf2 = vvals + VLEN * 2
+            instrs.append({"valu": [
+                ("-", offset, tmp_idx, ones), 
+                ("-", diff, vf2, vf1)
+            ]})
+            instrs.append({"valu": [("multiply_add", tmp_node_val, diff, offset, vf1)]})
+        else:
+            # Bad scalar loads and counter incrs to handle non-contiguous value loads
+            instrs.append({"alu": [("+", vtmp3 + j, self.scratch["forest_values_p"], tmp_idx + j) for j in range(8)]})
+            for j in range(0, 8, 2):
+                instrs.append({"load": [("load", tmp_node_val + j, vtmp3 + j), ("load", tmp_node_val + j + 1, vtmp3 + j + 1)]})
 
         instrs.append({"debug": [("vcompare", tmp_node_val, [(round, batch_base + j, "node_val") for j in range(VLEN)])]})
 
@@ -305,23 +327,15 @@ class KernelBuilder:
 
         # idx = 2*idx + (1 if val % 2 == 0 else 2)
         #     = 2*idx + 1 + (val & 1)
-
         instrs.append({"valu": [("&", vtmp1, tmp_val, ones)]})
         instrs.append({"valu": [("+", vtmp1, vtmp1, ones)]})
         instrs.append({"valu": [("multiply_add", tmp_idx, tmp_idx, twos, vtmp1)]})
-
-        # instrs.append({"valu": [("%", vtmp1, tmp_val, twos)]})
-        # instrs.append({"valu": [("==", vtmp1, vtmp1, zeros)]})
-        # instrs.append({"flow": [("vselect", vtmp3, vtmp1, ones, twos)]})
-        # instrs.append({"valu": [("*", tmp_idx, tmp_idx, twos)]})
-        # instrs.append({"valu": [("+", tmp_idx, tmp_idx, vtmp3)]})
 
         instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "next_idx") for j in range(VLEN)])]})
 
         # idx = 0 if idx >= n_nodes else idx
         if round == 10:
             instrs.append({"valu": [("+", tmp_idx, zeros, zeros)]})
-        # instrs.append({"flow": [("vselect", tmp_idx, vtmp1, tmp_idx, zeros)]})
 
         instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "wrapped_idx") for j in range(VLEN)])]})
 
