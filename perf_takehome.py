@@ -111,12 +111,29 @@ class KernelBuilder:
 
     def build_hash(self, val_hash_addr, vtmp1, vtmp2, round, batch_base):
         slots = []
+        HASH_STAGES = [
+            ("+", 0x7ED55D16, "+", "<<", 12),
+            ("^", 0xC761C23C, "^", ">>", 19),
+            ("+", 0x165667B1, "+", "<<", 5),
+            ("+", 0xD3A2646C, "^", "<<", 9),
+            ("+", 0xFD7046C5, "+", "<<", 3),
+            ("^", 0xB55A4F09, "^", ">>", 16),
+        ]
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(
-                {"valu": [(op1, vtmp1, val_hash_addr, self.vscratch_const(val1)), (op3, vtmp2, val_hash_addr, self.vscratch_const(val3))]}
-            )
-            slots.append({"valu": [(op2, val_hash_addr, vtmp1, vtmp2)]})
+            if hi % 2 == 0:
+                vsht3 = self.vscratch_const((1 << val3) + 1)
+                slots.append({"valu": [("multiply_add", val_hash_addr, val_hash_addr, vsht3, self.vscratch_const(val1))]})
+            else:
+                slots.append(
+                    {"valu": [(op1, vtmp1, val_hash_addr, self.vscratch_const(val1)), (op3, vtmp2, val_hash_addr, self.vscratch_const(val3))]}
+                )
+                # using some alu doesn't help here
+                # if hi == 1:
+                #     slots.append({"alu": [(op2, val_hash_addr + j, vtmp1 + j, vtmp2 + j) for j in range(VLEN)]})
+                # else:
+                #     slots.append({"valu": [(op2, val_hash_addr, vtmp1, vtmp2)]})
+                slots.append({"valu": [(op2, val_hash_addr, vtmp1, vtmp2)]})
             slots.append({"debug": [("vcompare", val_hash_addr, [(round, batch_base + j, "hash_stage", hi) for j in range(VLEN)])]})
         return slots
 
