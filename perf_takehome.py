@@ -17,6 +17,7 @@ We recommend you look through problem.py next.
 """
 
 from collections import defaultdict
+from dataclasses import dataclass
 import random
 import unittest
 
@@ -37,6 +38,30 @@ from problem import (
     reference_kernel2,
 )
 
+@dataclass
+class GroupScratch:
+    group_base: int
+    vtmp1: int
+    vtmp2: int
+    vtmp3: int
+    tmp_val: int
+    tmp_node_val: int
+    tmp_idx: int
+    tmp_addr: int
+    tmp_addr2: int
+
+    def __init__(self, builder: 'KernelBuilder', _mem_num: int, _group_start_offset: int):
+        self.group_base = _group_start_offset
+        self.mem_num = _mem_num
+        i = _mem_num
+        self.vtmp1 = builder.alloc_scratch(f"vtmp1_{i}", VLEN)
+        self.vtmp2 = builder.alloc_scratch(f"vtmp2_{i}", VLEN),
+        self.vtmp3 = builder.alloc_scratch(f"vtmp3_{i}", VLEN),
+        self.tmp_val = builder.alloc_scratch(f"tmp_val_{i}", VLEN),
+        self.tmp_node_val = builder.alloc_scratch(f"tmp_node_val_{i}", VLEN),
+        self.tmp_idx = builder.alloc_scratch(f"tmp_idx_{i}", VLEN),
+        self.tmp_addr = builder.alloc_scratch(f"tmp_addr_{i}", VLEN),
+        self.tmp_addr2 = builder.alloc_scratch(f"tmp_addr2_{i}", VLEN),
 
 class KernelBuilder:
     def __init__(self):
@@ -157,17 +182,16 @@ class KernelBuilder:
         ] for i in range(groups_per_chunk)]
 
         n_groups = batch_size // VLEN
-        for round in range(rounds):
-            for chunk in range(cdiv(n_groups , groups_per_chunk)):
-                start = chunk * groups_per_chunk
-                to_do = min(n_groups - start, groups_per_chunk)
-                # print(f"chunk {chunk}, start {start}, to_do {to_do}, batches_per_chunk {groups_per_chunk}")
-                batches = []
-                for i in range(to_do):
-                    # print(f"batch: {i + start}")
-                    batch_instrs = self.build_group(start + i, round, zeros, ones, twos, vn_nodes, *chunk_vars[i])
-                    batches.append(batch_instrs)
-                instrs.extend(pack(batches))
+        for chunk in range(cdiv(n_groups , groups_per_chunk)):
+            start = chunk * groups_per_chunk
+            to_do = min(n_groups - start, groups_per_chunk)
+            groups = []
+            for i in range(to_do):
+                group_instrs = []
+                for round in range(rounds):
+                    group_instrs.extend(self.build_group(start + i, round, zeros, ones, twos, vn_nodes, *chunk_vars[i]))
+                groups.append(group_instrs)
+            instrs.extend(pack(groups))
 
 
         self.instrs.extend(instrs)
@@ -185,7 +209,10 @@ class KernelBuilder:
 
 
 
-    def build_group(self, batch: int, round, zeros, ones, twos, vn_nodes, vtmp1, vtmp2, vtmp3, tmp_val, tmp_node_val, tmp_idx, tmp_addr, tmp_addr2):
+    def build_group(
+        self, batch: int, round, zeros, ones, twos, vn_nodes, 
+        vtmp1, vtmp2, vtmp3, tmp_val, tmp_node_val, tmp_idx, tmp_addr, tmp_addr2
+    ) -> list[dict]:
         instrs = []
 
         batch_base = batch * VLEN
