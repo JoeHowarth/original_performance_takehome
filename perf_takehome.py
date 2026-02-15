@@ -212,9 +212,6 @@ class KernelBuilder:
                 groups[i].extend(group_instrs)
         instrs.extend(pack(groups.values()))
         
-
-
-
         self.instrs.extend(instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
@@ -307,11 +304,17 @@ class KernelBuilder:
         instrs.append({"debug": [("vcompare", tmp_val, [(round, batch_base + j, "hashed_val") for j in range(VLEN)])]})
 
         # idx = 2*idx + (1 if val % 2 == 0 else 2)
-        instrs.append({"valu": [("%", vtmp1, tmp_val, twos)]})
-        instrs.append({"valu": [("==", vtmp1, vtmp1, zeros)]})
-        instrs.append({"flow": [("vselect", vtmp3, vtmp1, ones, twos)]})
-        instrs.append({"valu": [("*", tmp_idx, tmp_idx, twos)]})
-        instrs.append({"valu": [("+", tmp_idx, tmp_idx, vtmp3)]})
+        #     = 2*idx + 1 + (val & 1)
+
+        instrs.append({"valu": [("&", vtmp1, tmp_val, ones)]})
+        instrs.append({"valu": [("+", vtmp1, vtmp1, ones)]})
+        instrs.append({"valu": [("multiply_add", tmp_idx, tmp_idx, twos, vtmp1)]})
+
+        # instrs.append({"valu": [("%", vtmp1, tmp_val, twos)]})
+        # instrs.append({"valu": [("==", vtmp1, vtmp1, zeros)]})
+        # instrs.append({"flow": [("vselect", vtmp3, vtmp1, ones, twos)]})
+        # instrs.append({"valu": [("*", tmp_idx, tmp_idx, twos)]})
+        # instrs.append({"valu": [("+", tmp_idx, tmp_idx, vtmp3)]})
 
         instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "next_idx") for j in range(VLEN)])]})
 
