@@ -121,6 +121,9 @@ class KernelBuilder:
 
         self.forest_height = forest_height
 
+        tmp1 = self.alloc_scratch(f"tmp1")
+
+        init_streams = []
         # Scratch space addresses
         init_vars = [
             "rounds",
@@ -284,7 +287,7 @@ class KernelBuilder:
             #     instrs.append({"valu": [("+", tmp_node_val, zeros, vvals)]})
             # else:
             #     instrs.append({"alu": [("+", tmp_node_val + j, zeros +j, vvals + j) for j in range(VLEN)]})
-        elif round % (self.forest_height + 1) == 1 and not (round == 1 and batch_base < -4):
+        elif round % (self.forest_height + 1) == 1 and not (round == 1 and batch_base < 4):
             # 3 valu
             vvals = self.scratch["short_forest_vec_vals"]
             offset = vtmp1
@@ -303,7 +306,7 @@ class KernelBuilder:
             # valu:  vmod tmp, val, 2
             # valu:  veq  mask, tmp, 0  
             # flow:  vselect child, mask, one_vec, two_vec   # bottleneck: 1 flow slot
-        elif round % (self.forest_height + 1) == 2 and not (round == 2 and batch_base < -4 ):
+        elif round % (self.forest_height + 1) == 2 and not (round == 2 and batch_base < 4 ):
         # elif round % (self.forest_height + 1) == 2 :
             # 9 valu
             vvals = self.scratch["short_forest_vec_vals"]
@@ -408,7 +411,7 @@ def pick_frontier_with_engine(
     import random
 
     l = len(streams_by_len)
-    if l < 8 or (l < 14 and random.random() > 0.9):
+    if l < 10 or (l < 14 and random.random() > 0.9):
         for _,si in streams_by_len:
             _, head = frontier[si]
             if head.get(engine):
@@ -464,8 +467,7 @@ def cross_packer(streams: list[list[dict]]):
                     rr = (fi + 1) % len(frontier)
                     goal -= take
                     progressed = True
-
-        # Try valu->alu expansion
+                # Try valu->alu expansion
         EXPANDABLE_OPS = {"+", "-", "*", "^", "&", "|", "<<", ">>", "%", "<", "==", "//", "cdiv", "!="}
 
         alu_remaining = SLOT_LIMITS["alu"] - len(instr["alu"])
