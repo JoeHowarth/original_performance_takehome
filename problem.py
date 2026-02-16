@@ -345,9 +345,46 @@ class Machine:
                     f'{{"name": "{val}", "cat": "op", "ph": "X", "pid": {len(self.cores) + core.id}, "tid": {BASE_ADDR_TID + addr}, "ts": {self.cycle}, "dur": 1 }},\n'
                 )
 
-    def trace_slot(self, core, slot, name, i):
+    STREAM_COLORS = [
+        "thread_state_running",     # green
+        "rail_response",            # blue
+        "rail_animation",           # purple
+        "good",                     # green
+        "bad",                      # red
+        "terrible",                 # dark red
+        "yellow",
+        "olive",
+        "generic_work",             # purple
+        "thread_state_iowait",      # orange
+        "thread_state_sleeping",    # grey
+        "cq_build_running",
+        "cq_build_passed",
+        "cq_build_failed",
+        "cq_build_abandoned",
+        "startup",
+        "heap_dump_stack_frame",
+        "light_memory_dump",
+        "rail_idle",
+        "black",
+    ]
+
+    def trace_slot(self, core, slot, name, i, meta=None):
+        entry = meta.get((name, i)) if meta else None
+        cname_str = ""
+        extra_args = ""
+        cat = "op"
+        if entry is not None:
+            stream_id, batch_id, round_id = entry
+            cname = self.STREAM_COLORS[stream_id % len(self.STREAM_COLORS)]
+            cname_str = f', "cname": "{cname}"'
+            extra_args = f', "stream": {stream_id}'
+            if batch_id is not None:
+                extra_args += f', "batch": {batch_id}'
+            if round_id is not None:
+                extra_args += f', "round": {round_id}'
+            cat = f"stream_{stream_id}"
         self.trace.write(
-            f'{{"name": "{slot[0]}", "cat": "op", "ph": "X", "pid": {core.id}, "tid": {self.tids[(core.id, name, i)]}, "ts": {self.cycle}, "dur": 1, "args":{{"slot": "{str(slot)}", "named": "{str(self.rewrite_slot(slot))}" }} }},\n'
+            f'{{"name": "{slot[0]}", "cat": "{cat}", "ph": "X", "pid": {core.id}, "tid": {self.tids[(core.id, name, i)]}, "ts": {self.cycle}, "dur": 1, "args":{{"slot": "{str(slot)}", "named": "{str(self.rewrite_slot(slot))}"{extra_args} }}{cname_str} }},\n'
         )
 
     def step(self, instr: Instruction, core):
@@ -363,7 +400,10 @@ class Machine:
         }
         self.scratch_write = {}
         self.mem_write = {}
+        meta = instr.get("_meta")
         for name, slots in instr.items():
+            if name.startswith("_"):
+                continue
             if name == "debug":
                 if not self.enable_debug:
                     continue
@@ -384,7 +424,7 @@ class Machine:
             assert len(slots) <= SLOT_LIMITS[name], (name, slots)
             for i, slot in enumerate(slots):
                 if self.trace is not None:
-                    self.trace_slot(core, slot, name, i)
+                    self.trace_slot(core, slot, name, i, meta)
                 ENGINE_FNS[name](core, *slot)
         for addr, val in self.scratch_write.items():
             core.scratch[addr] = val

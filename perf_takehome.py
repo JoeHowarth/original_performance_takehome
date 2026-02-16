@@ -201,11 +201,22 @@ class KernelBuilder:
             start = chunk * groups_per_chunk
             to_do = min(n_groups - start, groups_per_chunk)
             for i in range(to_do):
-                group_instrs = self.build_group_load(start + i, 0, *chunk_vars[i])
+                batch_num = start + i
+                group_instrs = self.build_group_load(batch_num, 0, *chunk_vars[i])
+                for instr in group_instrs:
+                    instr["_batch"] = batch_num
+                    instr["_round"] = -1
                 for round in range(rounds):
-                    g = self.build_group(start + i, round, *chunk_vars[i])
+                    g = self.build_group(batch_num, round, *chunk_vars[i])
+                    for instr in g:
+                        instr["_batch"] = batch_num
+                        instr["_round"] = round
                     group_instrs.extend(g)
-                group_instrs.extend(self.build_group_store(start + i, *chunk_vars[i]))
+                store_instrs = self.build_group_store(batch_num, *chunk_vars[i])
+                for instr in store_instrs:
+                    instr["_batch"] = batch_num
+                    instr["_round"] = rounds
+                group_instrs.extend(store_instrs)
                 groups[i].extend(group_instrs)
         # instrs.extend(pack(groups.values()))
         instrs.extend(cross_packer(list(groups.values())))
@@ -408,15 +419,13 @@ def pick_frontier_with_engine(
     streams_by_len: list[tuple[int,int]]
 ) -> int | None:
     n = len(frontier)
-    import random
 
     l = len(streams_by_len)
-    if l < 10 or (l < 14 and random.random() > 0.9):
+    if l < 8 or (l < 14 and random.random() > 0.8) :
         for _,si in streams_by_len:
             _, head = frontier[si]
             if head.get(engine):
                 return si
-
 
     for off in range(n):
         i = (start + off) % n
@@ -431,18 +440,29 @@ def cross_packer(streams: list[list[dict]]):
     streams = [pack_debug(s) for s in streams if s]
     # rr = 0
 
+    stats = {
+        "empty_slots": defaultdict(int),
+        "blocked_behind_head": defaultdict(int),
+        "blocked_by": defaultdict(int),
+    }
+    stable_ids = list(range(len(streams)))
     while True:
-        streams = [s for s in streams if s]
+        paired = [(s, sid) for s, sid in zip(streams, stable_ids) if s]
+        streams = [s for s, _ in paired]
+        stable_ids = [sid for _, sid in paired]
         for s in streams:
             trim_stream(s)
-        streams = [s for s in streams if s]
+        paired = [(s, sid) for s, sid in zip(streams, stable_ids) if s]
+        streams = [s for s, _ in paired]
+        stable_ids = [sid for _, sid in paired]
         if not streams:
             break
 
-        # Freeze frontier for this cycle: max 1 head per stream.
+        # Freeze frontier: si is index into current streams array
         frontier = [(si, streams[si][0]) for si in range(len(streams))]
 
         instr = defaultdict(list)
+        meta = {}  # (engine, slot_idx) -> stable_stream_id
         progressed = True
         rr = 0
         while progressed:
@@ -455,11 +475,17 @@ def cross_packer(streams: list[list[dict]]):
                     if fi is None:
                         break
 
-                    _, head = frontier[fi]
+                    si, head = frontier[fi]
+                    stable_id = stable_ids[si]
+                    batch_id = head.get("_batch")
+                    round_id = head.get("_round")
                     slots = head[engine]
                     take = min(goal, len(slots))
 
+                    base = len(instr[engine])
                     instr[engine].extend(slots[:take])
+                    for j in range(take):
+                        meta[(engine, base + j)] = (stable_id, batch_id, round_id)
                     del slots[:take]
                     if not slots:
                         head.pop(engine, None)
@@ -474,7 +500,10 @@ def cross_packer(streams: list[list[dict]]):
         while alu_remaining > 0:
             expanded = False
             for fi_idx in range(len(frontier)):
-                _, head = frontier[fi_idx]
+                si, head = frontier[fi_idx]
+                stable_id = stable_ids[si]
+                batch_id = head.get("_batch")
+                round_id = head.get("_round")
                 if not head.get("valu"):
                     continue
                 for vi, vop in enumerate(head["valu"]):
@@ -486,7 +515,10 @@ def cross_packer(streams: list[list[dict]]):
 
                         all_8 = [(op, dest+j, a1+j, a2+j) for j in range(VLEN)]
                         take = min(alu_remaining, VLEN)
+                        base = len(instr["alu"])
                         instr["alu"].extend(all_8[:take])
+                        for j in range(take):
+                            meta[("alu", base + j)] = (stable_id, batch_id, round_id)
                         if take < VLEN:
                             head.setdefault("alu", []).extend(all_8[take:])
                         alu_remaining -= take
@@ -497,27 +529,133 @@ def cross_packer(streams: list[list[dict]]):
             if not expanded:
                 break
 
-        packed.append({e: ops for e, ops in instr.items() if ops})
+        result = {e: ops for e, ops in instr.items() if ops}
+        if meta:
+            result["_meta"] = meta
+        packed.append(result)
+
+        # Analytics: check for blocked work behind partially-consumed heads
+        for engine in engine_order:
+            empty = SLOT_LIMITS[engine] - len(instr.get(engine, []))
+            if empty > 0:
+                stats["empty_slots"][engine] += empty
+                # Check which streams have this engine's work queued behind a stuck head
+                for si, head in frontier:
+                    if head and len(streams[si]) > 1:
+                        # Head is stuck (not empty), check next instruction
+                        next_instr = streams[si][1]
+                        if next_instr.get(engine):
+                            stats["blocked_behind_head"][engine] += 1
+                            # What's blocking the head from advancing?
+                            for blocking_eng in engine_order:
+                                if head.get(blocking_eng):
+                                    stats["blocked_by"][(engine, blocking_eng)] += 1
 
         # Advance at most one head per stream after the cycle.
         for si, head in frontier:
-            if not head:
+            if not head_has_work(head):
                 streams[si].pop(0)
 
-    return packed
+    # Print analytics
+    print("\n=== Cross-packer analytics ===")
+    print(f"Total packed cycles: {len(packed)}")
+    for engine in ("load", "valu", "alu", "store"):
+        empty = stats["empty_slots"][engine]
+        total = len(packed) * SLOT_LIMITS[engine]
+        pct = 100 * empty / total if total else 0
+        blocked = stats["blocked_behind_head"][engine]
+        print(f"  {engine:5s}: {empty:5d}/{total:5d} slots empty ({pct:4.1f}%), "
+              f"{blocked} stream-cycles blocked behind head")
+        # Show what's blocking
+        for eng2 in ("load", "valu", "alu", "store", "flow"):
+            b = stats["blocked_by"].get((engine, eng2), 0)
+            if b:
+                print(f"         blocked by residual {eng2}: {b}")
+    print()
 
-    streams = remove_empty_lists(streams)
-    while len(streams) > 0:
-        instr = mk()
-        remaining = SLOT_LIMITS.copy()
-        del remaining["debug"]
-        # pull slots until full
-        while not instr_full(instr):
-            for elem in streams:
-                if pres("load", elem):
-                    instr["load"].append()
+    # Slot budget analysis
+    NON_EXPANDABLE = {"multiply_add", "vbroadcast"}
+    total_slots = defaultdict(int)
+    non_exp_valu = 0
+    exp_valu = 0
+    per_round_slots = defaultdict(lambda: defaultdict(int))  # round -> engine -> count
+    per_round_non_exp = defaultdict(int)
+    per_round_exp = defaultdict(int)
 
+    for result in packed:
+        for engine, ops in result.items():
+            if engine.startswith("_"):
+                continue
+            total_slots[engine] += len(ops)
 
+    # Count from original streams (before packing) for per-round breakdown
+    # Re-derive from the packed meta
+    for result in packed:
+        meta = result.get("_meta", {})
+        for engine, ops in result.items():
+            if engine.startswith("_"):
+                continue
+            for i, op in enumerate(ops):
+                entry = meta.get((engine, i))
+                rnd = entry[2] if entry else None
+                if engine == "valu":
+                    if op[0] in NON_EXPANDABLE:
+                        non_exp_valu += 1
+                        if rnd is not None:
+                            per_round_non_exp[rnd] += 1
+                    else:
+                        exp_valu += 1
+                        if rnd is not None:
+                            per_round_exp[rnd] += 1
+                if rnd is not None:
+                    per_round_slots[rnd][engine] += 1
+
+    C = len(packed)
+    N = 19  # streams
+    print("=== Slot budget ===")
+    print(f"  valu: {total_slots['valu']} total ({non_exp_valu} non-expandable, {exp_valu} expandable)")
+    print(f"  alu:  {total_slots['alu']}")
+    print(f"  load: {total_slots['load']}")
+    print(f"  store:{total_slots['store']}")
+
+    # Theoretical minimum with valu<->alu expansion
+    # x = expandable valu kept as valu
+    # Constraint 1: non_exp + x <= 6*C  (valu capacity)
+    # Constraint 2: (exp - x)*8 + alu <= 12*C  (alu capacity)
+    # Constraint 3: load <= 2*C
+    # Balance: (non_exp + x)/6 = ((exp - x)*8 + alu)/12
+    total_alu = total_slots["alu"]
+    total_load = total_slots["load"]
+    # 12*(non_exp + x) = 6*((exp - x)*8 + alu)
+    # 12*non_exp + 12x = 6*8*exp - 48x + 6*alu
+    # 60x = 48*exp + 6*alu - 12*non_exp
+    if exp_valu > 0:
+        x_balanced = (48 * exp_valu + 6 * total_alu - 12 * non_exp_valu) / 60
+        x_balanced = max(0, min(exp_valu, x_balanced))
+        c_valu_alu = (non_exp_valu + x_balanced) / 6
+    else:
+        c_valu_alu = non_exp_valu / 6
+    c_load = total_load / 2
+    c_store = total_slots["store"] / 2
+    c_min = max(c_valu_alu, c_load, c_store)
+    bottleneck = "valu/alu" if c_valu_alu >= c_load and c_valu_alu >= c_store else "load" if c_load >= c_store else "store"
+
+    print(f"\n  Theoretical min (perfect packing + valu<->alu):")
+    print(f"    valu/alu balanced: {c_valu_alu:.0f} cycles (x={x_balanced:.0f} exp kept as valu)")
+    print(f"    load bound:        {c_load:.0f} cycles")
+    print(f"    store bound:       {c_store:.0f} cycles")
+    print(f"    => C_min = {c_min:.0f} ({bottleneck}-bound)")
+    print(f"    Actual: {C} cycles ({C/c_min:.2f}x theoretical)")
+
+    # Per-round breakdown
+    all_rounds = sorted(per_round_slots.keys())
+    print(f"\n  Per-round slot counts (summed across all streams):")
+    print(f"  {'rnd':>4s} {'valu':>5s} {'(ne)':>5s} {'(ex)':>5s} {'alu':>5s} {'load':>5s} {'store':>5s}")
+    for r in all_rounds:
+        s = per_round_slots[r]
+        ne = per_round_non_exp.get(r, 0)
+        ex = per_round_exp.get(r, 0)
+        print(f"  {r:4d} {s.get('valu',0):5d} {ne:5d} {ex:5d} {s.get('alu',0):5d} {s.get('load',0):5d} {s.get('store',0):5d}")
 
     return packed
 
