@@ -254,7 +254,6 @@ class Machine:
     def valu(self, core, *slot):
         match slot:
             case ("vbroadcast", dest, src):
-                print("_")
                 for i in range(VLEN):
                     self.scratch_write[dest + i] = core.scratch[src]
             case ("multiply_add", dest, a, b, c):

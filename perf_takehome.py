@@ -105,11 +105,11 @@ class KernelBuilder:
                 )
                 # using some alu doesn't help here
                 # if (hi ^ batch_base) % 2 == 0:
-                if hi == 1 or hi == 3:
-                    slots.append({"alu": [(op2, val_hash_addr + j, vtmp1 + j, vtmp2 + j) for j in range(VLEN)]})
-                else:
-                    slots.append({"valu": [(op2, val_hash_addr, vtmp1, vtmp2)]})
-                # slots.append({"valu": [(op2, val_hash_addr, vtmp1, vtmp2)]})
+                # if hi == 1 or hi == 3:
+                #     slots.append({"alu": [(op2, val_hash_addr + j, vtmp1 + j, vtmp2 + j) for j in range(VLEN)]})
+                # else:
+                #     slots.append({"valu": [(op2, val_hash_addr, vtmp1, vtmp2)]})
+                slots.append({"valu": [(op2, val_hash_addr, vtmp1, vtmp2)]})
             # slots.append({"debug": [("vcompare", val_hash_addr, [(round, batch_base + j, "hash_stage", hi) for j in range(VLEN)])]})
         return slots
 
@@ -121,9 +121,6 @@ class KernelBuilder:
 
         self.forest_height = forest_height
 
-        tmp1 = self.alloc_scratch(f"tmp1")
-
-        init_streams = []
         # Scratch space addresses
         init_vars = [
             "rounds",
@@ -287,7 +284,7 @@ class KernelBuilder:
             #     instrs.append({"valu": [("+", tmp_node_val, zeros, vvals)]})
             # else:
             #     instrs.append({"alu": [("+", tmp_node_val + j, zeros +j, vvals + j) for j in range(VLEN)]})
-        elif round % (self.forest_height + 1) == 1 and not (round == 1 and batch_base < 4):
+        elif round % (self.forest_height + 1) == 1 and not (round == 1 and batch_base < -4):
             # 3 valu
             vvals = self.scratch["short_forest_vec_vals"]
             offset = vtmp1
@@ -306,7 +303,7 @@ class KernelBuilder:
             # valu:  vmod tmp, val, 2
             # valu:  veq  mask, tmp, 0  
             # flow:  vselect child, mask, one_vec, two_vec   # bottleneck: 1 flow slot
-        elif round % (self.forest_height + 1) == 2 and not (round == 2 and batch_base < 4 ):
+        elif round % (self.forest_height + 1) == 2 and not (round == 2 and batch_base < -4 ):
         # elif round % (self.forest_height + 1) == 2 :
             # 9 valu
             vvals = self.scratch["short_forest_vec_vals"]
@@ -324,17 +321,22 @@ class KernelBuilder:
             d23    = tmp_addr2     # reuse
 
             # Cycle 1: offset + level-1 diffs [3 valu]
-            if batch % 2 == 0:
-                instrs.append({"valu": [
-                    ("-", offset, tmp_idx, vec_3), 
-                    ("-", d01, vf4, vf3),
-                    ("-", d23, vf6, vf5),
-                ]})
-            else:
-                instrs.append({
-                    "valu": [("-", offset, tmp_idx, vec_3), ("-", d01, vf4, vf3)],
-                    "alu": [("-", d23 + j, vf6 + j, vf5 + j) for j in range(VLEN)]
-                })
+            instrs.append({"valu": [
+                ("-", offset, tmp_idx, vec_3), 
+                ("-", d01, vf4, vf3),
+                ("-", d23, vf6, vf5),
+            ]})
+            # if batch % 2 == 0:
+            #     instrs.append({"valu": [
+            #         ("-", offset, tmp_idx, vec_3), 
+            #         ("-", d01, vf4, vf3),
+            #         ("-", d23, vf6, vf5),
+            #     ]})
+            # else:
+            #     instrs.append({
+            #         "valu": [("-", offset, tmp_idx, vec_3), ("-", d01, vf4, vf3)],
+            #         "alu": [("-", d23 + j, vf6 + j, vf5 + j) for j in range(VLEN)]
+            #     })
 
             # Cycle 2: bit extraction [2 valu]
             instrs.append({"valu": [
@@ -406,7 +408,7 @@ def pick_frontier_with_engine(
     import random
 
     l = len(streams_by_len)
-    if l < 10 or (l < 14 and random.random() > 0.9):
+    if l < 8 or (l < 14 and random.random() > 0.9):
         for _,si in streams_by_len:
             _, head = frontier[si]
             if head.get(engine):
@@ -462,6 +464,36 @@ def cross_packer(streams: list[list[dict]]):
                     rr = (fi + 1) % len(frontier)
                     goal -= take
                     progressed = True
+
+        # Try valu->alu expansion
+        EXPANDABLE_OPS = {"+", "-", "*", "^", "&", "|", "<<", ">>", "%", "<", "==", "//", "cdiv", "!="}
+
+        alu_remaining = SLOT_LIMITS["alu"] - len(instr["alu"])
+        while alu_remaining > 0:
+            expanded = False
+            for fi_idx in range(len(frontier)):
+                _, head = frontier[fi_idx]
+                if not head.get("valu"):
+                    continue
+                for vi, vop in enumerate(head["valu"]):
+                    if len(vop) == 4 and vop[0] in EXPANDABLE_OPS:
+                        op, dest, a1, a2 = vop
+                        head["valu"].pop(vi)
+                        if not head["valu"]:
+                            head.pop("valu", None)
+
+                        all_8 = [(op, dest+j, a1+j, a2+j) for j in range(VLEN)]
+                        take = min(alu_remaining, VLEN)
+                        instr["alu"].extend(all_8[:take])
+                        if take < VLEN:
+                            head.setdefault("alu", []).extend(all_8[take:])
+                        alu_remaining -= take
+                        expanded = True
+                        break
+                if expanded:
+                    break
+            if not expanded:
+                break
 
         packed.append({e: ops for e, ops in instr.items() if ops})
 
