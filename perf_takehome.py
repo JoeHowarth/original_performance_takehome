@@ -129,11 +129,12 @@ class KernelBuilder:
                     {"valu": [(op1, vtmp1, val_hash_addr, self.vscratch_const(val1)), (op3, vtmp2, val_hash_addr, self.vscratch_const(val3))]}
                 )
                 # using some alu doesn't help here
-                # if hi == 1:
-                #     slots.append({"alu": [(op2, val_hash_addr + j, vtmp1 + j, vtmp2 + j) for j in range(VLEN)]})
-                # else:
-                #     slots.append({"valu": [(op2, val_hash_addr, vtmp1, vtmp2)]})
-                slots.append({"valu": [(op2, val_hash_addr, vtmp1, vtmp2)]})
+                # if (hi ^ batch_base) % 2 == 0:
+                if hi == 1 or hi == 3:
+                    slots.append({"alu": [(op2, val_hash_addr + j, vtmp1 + j, vtmp2 + j) for j in range(VLEN)]})
+                else:
+                    slots.append({"valu": [(op2, val_hash_addr, vtmp1, vtmp2)]})
+                # slots.append({"valu": [(op2, val_hash_addr, vtmp1, vtmp2)]})
             # slots.append({"debug": [("vcompare", val_hash_addr, [(round, batch_base + j, "hash_stage", hi) for j in range(VLEN)])]})
         return slots
 
@@ -299,7 +300,11 @@ class KernelBuilder:
             # 1 valu (can be 0 for round 0)
             vvals = self.scratch["short_forest_vec_vals"]
             instrs.append({"valu": [("+", tmp_node_val, zeros, vvals)]})
-        elif round % (self.forest_height + 1) == 1:
+            # if batch_base % 2 == 0:
+            #     instrs.append({"valu": [("+", tmp_node_val, zeros, vvals)]})
+            # else:
+            #     instrs.append({"alu": [("+", tmp_node_val + j, zeros +j, vvals + j) for j in range(VLEN)]})
+        elif round % (self.forest_height + 1) == 1 and not (round == 1 and batch_base < 4):
             # 3 valu
             vvals = self.scratch["short_forest_vec_vals"]
             offset = vtmp1
@@ -311,7 +316,8 @@ class KernelBuilder:
                 ("-", diff, vf2, vf1)
             ]})
             instrs.append({"valu": [("multiply_add", tmp_node_val, diff, offset, vf1)]})
-        elif round % (self.forest_height + 1) == 2:
+        elif round % (self.forest_height + 1) == 2 and not (round == 2 and batch_base < 4 ):
+        # elif round % (self.forest_height + 1) == 2 :
             # 9 valu
             vvals = self.scratch["short_forest_vec_vals"]
             vec_3 = self.vscratch_const(3, "threes")
@@ -415,7 +421,7 @@ def pick_frontier_with_engine(
 
 def cross_packer(streams: list[list[dict]]):
     packed = []
-    engine_order = ("load", "valu", "alu", "flow", "store", "debug")
+    engine_order = ("load", "valu", "alu", "flow", "store")
     streams = [pack_debug(s) for s in streams if s]
     # rr = 0
 
@@ -432,9 +438,9 @@ def cross_packer(streams: list[list[dict]]):
 
         instr = defaultdict(list)
         progressed = True
+        rr = 0
         while progressed:
             progressed = False
-            rr = 0
             for engine in engine_order:
                 goal = SLOT_LIMITS[engine] - len(instr[engine])
                 while goal > 0:
