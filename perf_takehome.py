@@ -38,31 +38,6 @@ from problem import (
     reference_kernel2,
 )
 
-@dataclass
-class GroupScratch:
-    group_base: int
-    vtmp1: int
-    vtmp2: int
-    vtmp3: int
-    tmp_val: int
-    tmp_node_val: int
-    tmp_idx: int
-    tmp_addr: int
-    tmp_addr2: int
-
-    def __init__(self, builder: 'KernelBuilder', _mem_num: int, _group_start_offset: int):
-        self.group_base = _group_start_offset
-        self.mem_num = _mem_num
-        i = _mem_num
-        self.vtmp1 = builder.alloc_scratch(f"vtmp1_{i}", VLEN)
-        self.vtmp2 = builder.alloc_scratch(f"vtmp2_{i}", VLEN),
-        self.vtmp3 = builder.alloc_scratch(f"vtmp3_{i}", VLEN),
-        self.tmp_val = builder.alloc_scratch(f"tmp_val_{i}", VLEN),
-        self.tmp_node_val = builder.alloc_scratch(f"tmp_node_val_{i}", VLEN),
-        self.tmp_idx = builder.alloc_scratch(f"tmp_idx_{i}", VLEN),
-        self.tmp_addr = builder.alloc_scratch(f"tmp_addr_{i}", VLEN),
-        self.tmp_addr2 = builder.alloc_scratch(f"tmp_addr2_{i}", VLEN),
-
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
@@ -148,6 +123,7 @@ class KernelBuilder:
 
         tmp1 = self.alloc_scratch(f"tmp1")
 
+        init_streams = []
         # Scratch space addresses
         init_vars = [
             "rounds",
@@ -160,19 +136,26 @@ class KernelBuilder:
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+        self.alloc_scratch() # padding
+        # for i, v in enumerate(init_vars):
+            # self.add("load", ("const", self.scratch[v], i))
+            # self.add("load", ("load", self.scratch[v], tmp1))
+        self.add("load", ("vload", self.scratch["rounds"], 0))
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        # self.alloc_scratch("zeros", VLEN)
+        # self.vscratch_const(1, "ones")
+        # self.alloc_scratch("twos", VLEN)
 
-        zeros = self.vscratch_const(0, "zeros")
-        ones = self.vscratch_const(1, "ones")
-        twos = self.vscratch_const(2, "twos")
-        vn_nodes = self.alloc_scratch("vn_nodes", VLEN)
-        self.add("valu", ("vbroadcast", vn_nodes, self.scratch["n_nodes"]))
+
+        # zero_const = self.scratch_const(0)
+        # one_const = self.scratch_const(1)
+        # two_const = self.scratch_const(2)
+
+        # zeros = self.vscratch_const(0, "zeros")
+        # ones = self.vscratch_const(1, "ones")
+        # twos = self.vscratch_const(2, "twos")
+        # vn_nodes = self.alloc_scratch("vn_nodes", VLEN)
+        # self.add("valu", ("vbroadcast", vn_nodes, self.scratch["n_nodes"]))
 
 
 
@@ -239,7 +222,7 @@ class KernelBuilder:
 
         batch_base = batch * VLEN
         i_batch_const = self.scratch_const(batch_base)
-        zero = self.scratch_const(0, "zero")
+        zeros = self.vscratch_const(0, "zeros")
 
         # idx = mem[inp_indices_p + i]
         # val = mem[inp_values_p + i]
@@ -251,7 +234,7 @@ class KernelBuilder:
                 ]
             }
         )
-        instrs.append({"load": [("vload", tmp_val, tmp_addr2)], "valu": [("vbroadcast", tmp_idx, zero)]})
+        instrs.append({"load": [("vload", tmp_val, tmp_addr2)], "valu": [("vbroadcast", tmp_idx, zeros)]})
         # instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "idx") for j in range(VLEN)])]})
         # instrs.append({"debug": [("vcompare", tmp_val, [(round, batch_base + j, "val") for j in range(VLEN)])]})
 
@@ -316,6 +299,13 @@ class KernelBuilder:
                 ("-", diff, vf2, vf1)
             ]})
             instrs.append({"valu": [("multiply_add", tmp_node_val, diff, offset, vf1)]})
+
+            # instrs.append({"valu": ["%", vtmp1, ]})
+
+            # Option A: flow-heavy (1 flow + 2 valu)
+            # valu:  vmod tmp, val, 2
+            # valu:  veq  mask, tmp, 0  
+            # flow:  vselect child, mask, one_vec, two_vec   # bottleneck: 1 flow slot
         elif round % (self.forest_height + 1) == 2 and not (round == 2 and batch_base < 4 ):
         # elif round % (self.forest_height + 1) == 2 :
             # 9 valu
@@ -409,12 +399,23 @@ def trim_stream(stream: list[dict]) -> None:
         stream.pop(0)
 
 def pick_frontier_with_engine(
-    frontier: list[tuple[int, dict]], start: int, engine: str
+    frontier: list[tuple[int, dict]], start: int, engine: str,
+    streams_by_len: list[tuple[int,int]]
 ) -> int | None:
     n = len(frontier)
+    import random
+
+    l = len(streams_by_len)
+    if l < 10 or (l < 14 and random.random() > 0.9):
+        for _,si in streams_by_len:
+            _, head = frontier[si]
+            if head.get(engine):
+                return si
+
+
     for off in range(n):
         i = (start + off) % n
-        _, head = frontier[i]
+        si, head = frontier[i]
         if head.get(engine):
             return i
     return None
@@ -444,7 +445,8 @@ def cross_packer(streams: list[list[dict]]):
             for engine in engine_order:
                 goal = SLOT_LIMITS[engine] - len(instr[engine])
                 while goal > 0:
-                    fi = pick_frontier_with_engine(frontier, rr, engine)
+                    streams_by_len = sorted((-len(stream), si) for si,stream in enumerate(streams))
+                    fi = pick_frontier_with_engine(frontier, rr, engine, streams_by_len)
                     if fi is None:
                         break
 
