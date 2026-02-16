@@ -694,77 +694,6 @@ def cross_packer(streams: list[list[dict]]):
 
     return packed
 
-def remove_empty_lists(lists: list[list]) -> list[list]:
-    return list(filter(lambda x: len(x) != 0, lists))
-
-def pack(batches: list[list[dict]]):
-    assert len(batches) > 0
-
-    packed = [{}]
-    idx = -1
-    for i,batch in enumerate(batches):
-        if i == 0:
-            drain_list(packed, batch, debug=True)
-        drain_list(packed, batch)
-    return packed
-
-def drain_list(into_list: list[dict[str, list]], from_list: list[dict[str,list[tuple]]], debug = False):
-    # if debug:
-    #     print_instrs(from_list[:50], no_debug=False)
-    from_list = pack_debug(from_list)
-    # if debug:
-    #     print_instrs(from_list[:50], no_debug=False)
-    if len(into_list) == 0:
-        into_list.append({})
-    idx = -1
-    # if debug:
-    #     print_instrs(from_list[:50])
-    for from_ in from_list:
-        idx = next_with_slots(into_list, idx)
-        drain(into_list[idx], from_)
-        while not instr_empty(from_):
-            idx = next_with_slots(into_list, idx)
-            drain(into_list[idx], from_)
-    # if debug:
-    #     print_instrs(into_list[:50])
-            
-
-def print_instrs(xs: list[dict], no_debug = True):
-    print("")
-    out = []
-    for x in xs:
-        x = {name:len(slots) for name, slots in x.items()}
-        if "debug" in x and no_debug:
-            del x["debug"]
-        out.append(x)
-    print(out)
-
-
-def next_with_slots(l: list[dict], i:int) -> int:
-    for i in range(i+1, len(l)):
-        if not instr_full(l[i]):
-            return i
-    l.append({})
-    return len(l) -1
-
-
-def instr_empty(instr: dict) -> bool: 
-    if len(instr) == 0:
-        return True
-    for ops in instr.values():
-        if len(ops) == 0:
-            return True
-    return False
-
-
-def instr_full(instr: dict) -> bool: 
-    for slot, limit in SLOT_LIMITS.items():
-        if slot not in instr:
-            return False
-        if len(instr[slot]) < limit:
-            return False
-    return True
-
 def pack_debug(instrs: list[dict]):
     no_debug = []
     dbgs = []
@@ -780,30 +709,6 @@ def pack_debug(instrs: list[dict]):
                 dbgs = []
             no_debug.append(instr)
     return no_debug
-
-
-def drain(into: dict[str, list[tuple]], from_: dict[str,list[tuple]]):
-    from_empty = True
-    for slot, limit in SLOT_LIMITS.items():
-        if slot not in from_:
-            continue
-        if slot not in into:
-            into[slot] = []
-        available = limit - len(into[slot]) 
-
-        assert available >= 0, "instr packed beyond limit"
-        if available == 0:
-            continue
-        if available >= len(from_[slot]):
-            into[slot].extend(from_[slot])
-            del from_[slot]
-        else:
-            into[slot].extend(from_[slot][:available])
-            from_[slot] = from_[slot][available:]
-            from_empty = False
-    instr_full = all(( len(ops) == SLOT_LIMITS[slot] for slot, ops in into.items()))
-    return (instr_full, from_empty)
-
 
 BASELINE = 147_734
 
@@ -858,33 +763,6 @@ def do_kernel_test(
 
 
 class Tests(unittest.TestCase):
-    def test_pack(self):
-        vtmp1, tmp_val, twos, zeros, ones, vtmp3, tmp_idx = 1,2,3,4,5,6,7
-        import copy 
-        instrs = []
-        instrs.append({"load": [("%", vtmp1, tmp_val, twos)]})
-        instrs.append({"valu": [("==", vtmp1, vtmp1, zeros)]})
-        instrs.append({"valu": [("!=", vtmp1, vtmp1, zeros)]})
-        # instrs.append({"valu": [("*", tmp_idx, tmp_idx, twos)]})
-        # instrs.append({"valu": [("+", tmp_idx, tmp_idx, vtmp3)]})
-
-        batches = [copy.deepcopy(instrs) for i in range(3)]
-
-        packed = pack(batches)
-        for j, instr in enumerate(packed):
-            print(f"\nInstr {j}")
-            for name,slot in instr.items():
-                print(f"{name}: {len(slot)}")
-                print(slot)
-
-
-        # packed = pack(batches)
-        # print("=== Done ===")
-        # for instr in packed:
-        #     print(instr)
-        #     print([(name, len(slot)) for name,slot in instr.items()])
-
-
 
     def test_ref_kernels(self):
         """
