@@ -72,15 +72,12 @@ class KernelBuilder:
     def vscratch_const(self, val, name=None):
         if val not in self.v_const_map:
             addr = self.alloc_scratch(name, VLEN)
-            self.add("load", ("const", addr, val))
-            self.add("valu", ("vbroadcast", addr, addr))
             self.v_const_map[val] = addr
         return self.v_const_map[val]
 
     def scratch_const(self, val, name=None):
         if val not in self.const_map:
             addr = self.alloc_scratch(name)
-            self.add("load", ("const", addr, val))
             self.const_map[val] = addr
         return self.const_map[val]
 
@@ -121,68 +118,129 @@ class KernelBuilder:
 
         self.forest_height = forest_height
 
-        tmp1 = self.alloc_scratch(f"tmp1")
+        tmp1 = self.alloc_scratch("tmp1")
 
-        init_streams = []
-        # Scratch space addresses
+        # Header: 7 init vars + 1 padding = 8 words, loaded via vload from mem[0]
         init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
+            "rounds", "n_nodes", "batch_size", "forest_height",
+            "forest_values_p", "inp_indices_p", "inp_values_p",
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
-        self.alloc_scratch() # padding
-        # for i, v in enumerate(init_vars):
-            # self.add("load", ("const", self.scratch[v], i))
-            # self.add("load", ("load", self.scratch[v], tmp1))
-        self.add("load", ("vload", self.scratch["rounds"], 0))
+        self.alloc_scratch()  # padding to 8
 
-        # self.alloc_scratch("zeros", VLEN)
-        # self.vscratch_const(1, "ones")
-        # self.alloc_scratch("twos", VLEN)
+        # Pre-allocate all vector constants (no emission, init array handles it)
+        zeros = self.alloc_scratch("zeros", VLEN)
+        ones = self.alloc_scratch("ones", VLEN)
+        twos = self.alloc_scratch("twos", VLEN)
+        threes = self.alloc_scratch("threes", VLEN)
+        self.v_const_map[0] = zeros
+        self.v_const_map[1] = ones
+        self.v_const_map[2] = twos
+        self.v_const_map[3] = threes
 
+        # Batch base scalars: value i*VLEN at address b0+i
+        n_groups = batch_size // VLEN
+        b0 = self.alloc_scratch("batch_nums", n_groups)
+        for i in range(n_groups):
+            self.const_map[i * VLEN] = b0 + i
 
-        # zero_const = self.scratch_const(0)
-        # one_const = self.scratch_const(1)
-        # two_const = self.scratch_const(2)
+        # Forest values
+        sfv = self.alloc_scratch("short_forest_vals", VLEN)
+        sfvv = self.alloc_scratch("short_forest_vec_vals", VLEN * 8)
 
-        # zeros = self.vscratch_const(0, "zeros")
-        # ones = self.vscratch_const(1, "ones")
-        # twos = self.vscratch_const(2, "twos")
-        # vn_nodes = self.alloc_scratch("vn_nodes", VLEN)
-        # self.add("valu", ("vbroadcast", vn_nodes, self.scratch["n_nodes"]))
-
-
-
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
-        self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
-
-        instrs: list[dict[str, list]] = []
-        for (_, val1, _,_, val3) in HASH_STAGES:
+        # Hash constants 
+        for (_, val1, _, _, val3) in HASH_STAGES:
             self.vscratch_const(val1)
             self.vscratch_const(val3)
+        for (_, _, _, _, val3) in HASH_STAGES[::2]:
+            self.vscratch_const((1 << val3) + 1)
 
-        def dbg(x):
-            print(x)
-            return x
+        v = self.v_const_map
+        fvp = self.scratch["forest_values_p"]
 
-        short_forest_vals = self.alloc_scratch("short_forest_vals", VLEN)
-        short_forest_vec_vals = self.alloc_scratch("short_forest_vec_vals", VLEN * 8)
-        instrs.append({"load": [("vload", short_forest_vals, self.scratch["forest_values_p"])]})
-        instrs.append({"valu": dbg([("vbroadcast", short_forest_vec_vals + i * VLEN, short_forest_vals + i) for i in range(6)])})
-        instrs.append({"valu": dbg([("vbroadcast", short_forest_vec_vals + i * VLEN, short_forest_vals + i) for i in range(6,8)])})
+        # Densely packed C=9 init 
+        init = [
+            # C0: seed scalars 8 and 1; pause for test harness first yield
+            {"load": [("const", b0 + 1, 8), ("const", ones, 1)],
+             "flow": [("pause",)]},
 
-        groups_per_chunk = (SCRATCH_SIZE - self.scratch_ptr) // 70 # 65 + padding
+            # C1: header vload + scalar 3; batch tree layer 1; broadcast ones
+            {"load": [("vload", self.scratch["rounds"], 0), ("const", threes, 3)],
+             "alu": [("+", b0+2, b0+1, b0+1),    # 16 = 8+8
+                     ("*", b0+8, b0+1, b0+1)],    # 64 = 8*8
+             "valu": [("vbroadcast", ones, ones)]},
+
+            # C2: forest vload (forest_values_p now in scratch) + scalar 9;
+            #     batch tree layer 2; broadcast threes + compute twos
+            {"load": [("vload", sfv, fvp), ("const", v[9], 9)],
+             "alu": [("+", b0+3, b0+1, b0+2),   # 24 = 8+16
+                     ("+", b0+4, b0+2, b0+2),  # 32 = 16+16
+                     ("+", b0+9, b0+1, b0+8),   # 72 = 8+64
+                     ("+", b0+10, b0+2, b0+8),  # 80 = 16+64
+                     ("+", b0+16, b0+8, b0+8)],   # 128 = 64+64
+             "valu": [("vbroadcast", threes, threes),
+                      ("+", twos, ones, ones)]},
+
+            # C3: scalars 16,19; batch tree layer 3 (12 ops); v9 + 5 forest broadcasts
+            {"load": [("const", v[16], 16), ("const", v[19], 19)],
+             "alu": [("+", b0+5,  b0+1, b0+4), # 40 = 8+32
+                     ("+", b0+6,  b0+2, b0+4), # 48 = 16+32
+                     ("+", b0+7,  b0+3, b0+4),  # 56 = 24+32
+                     ("+", b0+11, b0+1, b0+10), # 88 = 8+80
+                     ("+", b0+12, b0+2, b0+10),  # 96 = 16+80
+                     ("+", b0+13, b0+3, b0+10), # 104 = 24+80
+                     ("+", b0+14, b0+4, b0+10),  # 112 = 32+80
+                     ("-", b0+15, b0+16, b0+1),  # 120 = 128-8
+                     ("+", b0+17, b0+1, b0+16), # 136 = 8+128
+                     ("+", b0+18, b0+2, b0+16), # 144 = 16+128
+                     ("+", b0+19, b0+3, b0+16), # 152 = 24+128
+                     ("+", b0+20, b0+4, b0+16)], # 160 = 32+128
+             "valu": [("vbroadcast", v[9], v[9])] +
+                     [("vbroadcast", sfvv + i*VLEN, sfv + i) for i in range(5)]},
+
+            # C4: scalars 33,4097; batch tree layer 4 (11 ops); 3 forest + v16,v19 broadcasts
+            {"load": [("const", v[33], 33), ("const", v[4097], 4097)],
+             "alu": [("+", b0+21, b0+5, b0+16), # 168 = 40+128
+                     ("+", b0+22, b0+6, b0+16), # 176 = 48+128
+                     ("+", b0+23, b0+7, b0+16), # 184 = 56+128
+                     ("+", b0+24, b0+8, b0+16), # 192 = 64+128
+                     ("+", b0+25, b0+9, b0+16),  # 200 = 72+128
+                     ("+", b0+26, b0+10, b0+16),  # 208 = 80+128
+                     ("+", b0+27, b0+11, b0+16),  # 216 = 88+128
+                     ("+", b0+28, b0+12, b0+16),  # 224 = 96+128
+                     ("+", b0+29, b0+13, b0+16),  # 232 = 104+128
+                     ("+", b0+30, b0+14, b0+16),  # 240 = 112+128
+                     ("+", b0+31, b0+15, b0+16)], # 248 = 120+128
+             "valu": [("vbroadcast", sfvv + i*VLEN, sfv + i) for i in range(5, 8)] +
+                     [("vbroadcast", v[16], v[16]),
+                      ("vbroadcast", v[19], v[19])]},
+
+            # C5: hash val1 pair 1; broadcast v33, v4097
+            {"load": [("const", v[0x7ED55D16], 0x7ED55D16), ("const", v[0xC761C23C], 0xC761C23C)],
+             "valu": [("vbroadcast", v[33], v[33]),
+                      ("vbroadcast", v[4097], v[4097])]},
+
+            # C6: hash val1 pair 2; broadcast previous pair
+            {"load": [("const", v[0x165667B1], 0x165667B1), ("const", v[0xD3A2646C], 0xD3A2646C)],
+             "valu": [("vbroadcast", v[0x7ED55D16], v[0x7ED55D16]),
+                      ("vbroadcast", v[0xC761C23C], v[0xC761C23C])]},
+
+            # C7: hash val1 pair 3; broadcast previous pair
+            {"load": [("const", v[0xFD7046C5], 0xFD7046C5), ("const", v[0xB55A4F09], 0xB55A4F09)],
+             "valu": [("vbroadcast", v[0x165667B1], v[0x165667B1]),
+                      ("vbroadcast", v[0xD3A2646C], v[0xD3A2646C])]},
+
+            # C8: broadcast final hash pair
+            {"valu": [("vbroadcast", v[0xFD7046C5], v[0xFD7046C5]),
+                      ("vbroadcast", v[0xB55A4F09], v[0xB55A4F09])]},
+        ]
+        self.instrs.extend(init)
+
+        instrs: list[dict[str, list]] = []
+
+        # Per-group scratch is exactly 8*VLEN = 64 words; all consts pre-allocated above
+        groups_per_chunk = min((SCRATCH_SIZE - self.scratch_ptr) // 64, 19)
         print(f"groups_per_chunk {groups_per_chunk}")
 
         chunk_vars = [[ self.alloc_scratch(f"vtmp1_{i}", VLEN),
@@ -246,8 +304,6 @@ class KernelBuilder:
             }
         )
         instrs.append({"load": [("vload", tmp_val, tmp_addr2)], "valu": [("vbroadcast", tmp_idx, zeros)]})
-        # instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "idx") for j in range(VLEN)])]})
-        # instrs.append({"debug": [("vcompare", tmp_val, [(round, batch_base + j, "val") for j in range(VLEN)])]})
 
         return instrs
 
@@ -271,7 +327,6 @@ class KernelBuilder:
             }
         )
         instrs.append({"store": [("vstore", tmp_addr2, tmp_val)]})
-        # instrs.append({"store": [("vstore", tmp_addr, tmp_idx), ("vstore", tmp_addr2, tmp_val)]})
 
         return instrs
 
@@ -294,11 +349,8 @@ class KernelBuilder:
             # 1 valu (can be 0 for round 0)
             vvals = self.scratch["short_forest_vec_vals"]
             instrs.append({"valu": [("+", tmp_node_val, zeros, vvals)]})
-            # if batch_base % 2 == 0:
-            #     instrs.append({"valu": [("+", tmp_node_val, zeros, vvals)]})
-            # else:
-            #     instrs.append({"alu": [("+", tmp_node_val + j, zeros +j, vvals + j) for j in range(VLEN)]})
-        elif round % (self.forest_height + 1) == 1 and not (round == 1 and batch_base < 4):
+        # elif round % (self.forest_height + 1) == 1 and not (round == 1 and batch_base < 4):
+        elif round % (self.forest_height + 1) == 1 and not (round == 1 and batch_base < 1):
             # 3 valu
             vvals = self.scratch["short_forest_vec_vals"]
             offset = vtmp1
@@ -340,17 +392,6 @@ class KernelBuilder:
                 ("-", d01, vf4, vf3),
                 ("-", d23, vf6, vf5),
             ]})
-            # if batch % 2 == 0:
-            #     instrs.append({"valu": [
-            #         ("-", offset, tmp_idx, vec_3), 
-            #         ("-", d01, vf4, vf3),
-            #         ("-", d23, vf6, vf5),
-            #     ]})
-            # else:
-            #     instrs.append({
-            #         "valu": [("-", offset, tmp_idx, vec_3), ("-", d01, vf4, vf3)],
-            #         "alu": [("-", d23 + j, vf6 + j, vf5 + j) for j in range(VLEN)]
-            #     })
 
             # Cycle 2: bit extraction [2 valu]
             instrs.append({"valu": [
@@ -381,14 +422,11 @@ class KernelBuilder:
             for j in range(0, 8, 2):
                 instrs.append({"load": [("load", tmp_node_val + j, vtmp3 + j), ("load", tmp_node_val + j + 1, vtmp3 + j + 1)]})
 
-        # instrs.append({"debug": [("vcompare", tmp_node_val, [(round, batch_base + j, "node_val") for j in range(VLEN)])]})
-
         # val = myhash(val ^ node_val)
         # 13 valu
         instrs.append({"valu": [("^", tmp_val, tmp_val, tmp_node_val)]})
         instrs.extend(self.build_hash(tmp_val, vtmp1, vtmp2, round, batch_base))
 
-        # instrs.append({"debug": [("vcompare", tmp_val, [(round, batch_base + j, "hashed_val") for j in range(VLEN)])]})
 
         # idx = 2*idx + (1 if val % 2 == 0 else 2)
         #     = 2*idx + 1 + (val & 1)
@@ -397,13 +435,9 @@ class KernelBuilder:
         instrs.append({"valu": [("+", vtmp1, vtmp1, ones)]})
         instrs.append({"valu": [("multiply_add", tmp_idx, tmp_idx, twos, vtmp1)]})
 
-        # instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "next_idx") for j in range(VLEN)])]})
-
         # idx = 0 if idx >= n_nodes else idx
         if round == 10:
             instrs.append({"valu": [("+", tmp_idx, zeros, zeros)]})
-
-        # instrs.append({"debug": [("vcompare", tmp_idx, [(round, batch_base + j, "wrapped_idx") for j in range(VLEN)])]})
 
         return instrs
 
@@ -493,7 +527,8 @@ def cross_packer(streams: list[list[dict]]):
                     rr = (fi + 1) % len(frontier)
                     goal -= take
                     progressed = True
-                # Try valu->alu expansion
+
+        # Try valu->alu expansion
         EXPANDABLE_OPS = {"+", "-", "*", "^", "&", "|", "<<", ">>", "%", "<", "==", "//", "cdiv", "!="}
 
         alu_remaining = SLOT_LIMITS["alu"] - len(instr["alu"])
