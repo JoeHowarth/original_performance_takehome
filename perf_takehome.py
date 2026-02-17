@@ -18,6 +18,9 @@ We recommend you look through problem.py next.
 
 from collections import defaultdict
 from dataclasses import dataclass
+import contextlib
+import io
+import itertools
 import random
 import unittest
 
@@ -38,14 +41,32 @@ from problem import (
     reference_kernel2,
 )
 
+DEFAULT_PARAMS = {
+    # build_group guard thresholds: batch_base < threshold falls to scalar loads
+    # (0=no guard, 1-8=exclude 1 group, 9-16=exclude 2 groups, etc.)
+    "level1_guard": 0,
+    "level2_guard": 0,
+    "level3_guard": 0,
+    # Packer stream selection heuristic
+    "packer_short_threshold": 12,
+    "packer_medium_threshold": 14,
+    "packer_random_prob": 0.8,
+    # Max groups processed simultaneously (limited by scratch space)
+    "groups_per_chunk_cap": 19,
+    # Engine fill priority order
+    "engine_order": ("load", "valu", "alu", "flow", "store"),
+}
+
+
 class KernelBuilder:
-    def __init__(self):
+    def __init__(self, params=None):
         self.instrs = []
         self.scratch = {}
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
         self.v_const_map = {}
+        self.params = {**DEFAULT_PARAMS, **(params or {})}
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -256,7 +277,7 @@ class KernelBuilder:
         instrs: list[dict[str, list]] = []
 
         # Per-group scratch is exactly 8*VLEN = 64 words; all consts pre-allocated above
-        groups_per_chunk = min((SCRATCH_SIZE - self.scratch_ptr) // 64, 19)
+        groups_per_chunk = min((SCRATCH_SIZE - self.scratch_ptr) // 64, self.params["groups_per_chunk_cap"])
         print(f"groups_per_chunk {groups_per_chunk}")
 
         chunk_vars = [[ self.alloc_scratch(f"vtmp1_{i}", VLEN),
@@ -293,7 +314,7 @@ class KernelBuilder:
                 group_instrs.extend(store_instrs)
                 groups[i].extend(group_instrs)
         # instrs.extend(pack(groups.values()))
-        instrs.extend(cross_packer(list(groups.values())))
+        instrs.extend(cross_packer(list(groups.values()), params=self.params))
         
         self.instrs.extend(instrs)
         # Required to match with the yield in reference_kernel2
@@ -364,8 +385,7 @@ class KernelBuilder:
         if round % (self.forest_height + 1) == 0:
             # 1 valu (can be 0 for round 0)
             pass
-        # elif round % (self.forest_height + 1) == 1 and not (round == 1 and batch_base < 4):
-        elif round % (self.forest_height + 1) == 1 and not (round == 1 and batch_base < 1):
+        elif round % (self.forest_height + 1) == 1 and not (round == 1 and batch_base < self.params["level1_guard"]):
             # 3 valu
             vvals = self.scratch["short_forest_vec_vals"]
             offset = vtmp1
@@ -384,8 +404,7 @@ class KernelBuilder:
             # valu:  vmod tmp, val, 2
             # valu:  veq  mask, tmp, 0  
             # flow:  vselect child, mask, one_vec, two_vec   # bottleneck: 1 flow slot
-        elif round % (self.forest_height + 1) == 2 and not (round == 2 and batch_base < 4 ):
-        # elif round % (self.forest_height + 1) == 2 :
+        elif round % (self.forest_height + 1) == 2 and not (round == 2 and batch_base < self.params["level2_guard"]):
             # 9 valu
             vvals = self.scratch["short_forest_vec_vals"]
             vec_3 = self.vscratch_const(3, "threes")
@@ -430,8 +449,7 @@ class KernelBuilder:
             instrs.append({"valu": [
                 ("multiply_add", tmp_node_val, da, bit1, d01),
             ]})
-        # elif round % (self.forest_height + 1) == 3 and not ((round == 3 and batch < 8) or (round > 10 and batch > 30)):
-        elif round % (self.forest_height + 1) == 3: 
+        elif round % (self.forest_height + 1) == 3 and not (round == 3 and batch_base < self.params["level3_guard"]):
             # Level 3: vselect among nodes 7-14
             vvals = self.scratch["short_forest_vec_vals"]
             sfvv2_addr = self.scratch["short_forest_vec_vals2"]
@@ -506,12 +524,14 @@ def trim_stream(stream: list[dict]) -> None:
 
 def pick_frontier_with_engine(
     frontier: list[tuple[int, dict]], start: int, engine: str,
-    streams_by_len: list[tuple[int,int]]
+    streams_by_len: list[tuple[int,int]], params: dict = None
 ) -> int | None:
+    if params is None:
+        params = DEFAULT_PARAMS
     n = len(frontier)
 
     l = len(streams_by_len)
-    if l < 8 or (l < 14 and random.random() > 0.8) :
+    if l < params["packer_short_threshold"] or (l < params["packer_medium_threshold"] and random.random() > params["packer_random_prob"]):
         for _,si in streams_by_len:
             _, head = frontier[si]
             if head.get(engine):
@@ -524,9 +544,11 @@ def pick_frontier_with_engine(
             return i
     return None
 
-def cross_packer(streams: list[list[dict]]):
+def cross_packer(streams: list[list[dict]], params: dict = None):
+    if params is None:
+        params = DEFAULT_PARAMS
     packed = []
-    engine_order = ("load", "valu", "alu", "flow", "store")
+    engine_order = params["engine_order"]
     streams = [pack_debug(s) for s in streams if s]
     # rr = 0
 
@@ -561,7 +583,7 @@ def cross_packer(streams: list[list[dict]]):
                 goal = SLOT_LIMITS[engine] - len(instr[engine])
                 while goal > 0:
                     streams_by_len = sorted((-len(stream), si) for si,stream in enumerate(streams))
-                    fi = pick_frontier_with_engine(frontier, rr, engine, streams_by_len)
+                    fi = pick_frontier_with_engine(frontier, rr, engine, streams_by_len, params)
                     if fi is None:
                         break
 
@@ -776,14 +798,23 @@ def do_kernel_test(
     seed: int = 123,
     trace: bool = False,
     prints: bool = False,
+    params: dict = None,
+    quiet: bool = False,
 ):
+    if quiet:
+        f = io.StringIO()
+        with contextlib.redirect_stdout(f):
+            return do_kernel_test(
+                forest_height, rounds, batch_size,
+                seed=seed, trace=trace, prints=prints, params=params,
+            )
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
     forest = Tree.generate(forest_height)
     inp = Input.generate(forest, batch_size, rounds)
     mem = build_mem_image(forest, inp)
 
-    kb = KernelBuilder()
+    kb = KernelBuilder(params=params)
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
     # print(kb.instrs)
 
@@ -851,6 +882,62 @@ class Tests(unittest.TestCase):
 
     def test_kernel_cycles(self):
         do_kernel_test(10, 16, 256)
+
+
+def sweep_params(param_grid: dict = None, seed: int = 123, top_n: int = 10):
+    """
+    Sweep over parameter combinations and report the best results.
+
+    param_grid: dict of param_name -> list of values to try.
+                Only specified params are swept; others use DEFAULT_PARAMS.
+    """
+    if param_grid is None:
+        param_grid = {
+            "level1_guard": [0, 1, 8],
+            "level2_guard": [0, 4, 8],
+            "level3_guard": [0, 8],
+            "packer_short_threshold": [4, 8, 12],
+            "packer_medium_threshold": [8, 14, 20],
+            "packer_random_prob": [0.0, 0.5, 0.8, 1.0],
+            "groups_per_chunk_cap": [16, 18, 19],
+        }
+
+    keys = list(param_grid.keys())
+    values = [param_grid[k] for k in keys]
+    combos = list(itertools.product(*values))
+    print(f"Sweeping {len(combos)} combinations across {keys}")
+
+    results = []
+    best_so_far = float("inf")
+    for idx, combo in enumerate(combos):
+        overrides = dict(zip(keys, combo))
+        params = {**DEFAULT_PARAMS, **overrides}
+        try:
+            cycles = do_kernel_test(10, 16, 256, seed=seed, params=params, quiet=True)
+        except Exception as e:
+            print(f"  [{idx+1}/{len(combos)}] FAIL {overrides}: {e}")
+            continue
+        if cycles < best_so_far:
+            best_so_far = cycles
+            marker = " ***"
+        else:
+            marker = ""
+        results.append((cycles, idx, overrides))
+        if (idx + 1) % 50 == 0 or marker:
+            print(f"  [{idx+1}/{len(combos)}] {cycles} cycles {overrides}{marker}")
+
+    results.sort(key=lambda r: r[0])
+    print(f"\n=== Top {top_n} results ===")
+    for i, (cycles, _, overrides) in enumerate(results[:top_n]):
+        delta = {k: v for k, v in overrides.items() if v != DEFAULT_PARAMS.get(k)}
+        print(f"  {i+1}. {cycles} cycles  (speedup {BASELINE/cycles:.1f}x)  delta={delta}")
+
+    print(f"\n=== Bottom 3 ===")
+    for cycles, _, overrides in results[-3:]:
+        delta = {k: v for k, v in overrides.items() if v != DEFAULT_PARAMS.get(k)}
+        print(f"  {cycles} cycles  delta={delta}")
+
+    return results
 
 
 # To run all the tests:
