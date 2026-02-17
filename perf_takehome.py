@@ -148,13 +148,17 @@ class KernelBuilder:
         # Forest values
         sfv = self.alloc_scratch("short_forest_vals", VLEN)
         sfvv = self.alloc_scratch("short_forest_vec_vals", VLEN * 8)
+        sfv2 = self.alloc_scratch("short_forest_vals2", VLEN)
+        sfvv2 = self.alloc_scratch("short_forest_vec_vals2", VLEN * 7)
 
-        # Hash constants 
+        # Hash constants
         for (_, val1, _, _, val3) in HASH_STAGES:
             self.vscratch_const(val1)
             self.vscratch_const(val3)
         for (_, _, _, _, val3) in HASH_STAGES[::2]:
             self.vscratch_const((1 << val3) + 1)
+        self.vscratch_const(4)
+        self.vscratch_const(7)
 
         v = self.v_const_map
         fvp = self.scratch["forest_values_p"]
@@ -178,7 +182,8 @@ class KernelBuilder:
                      ("+", b0+4, b0+2, b0+2),  # 32 = 16+16
                      ("+", b0+9, b0+1, b0+8),   # 72 = 8+64
                      ("+", b0+10, b0+2, b0+8),  # 80 = 16+64
-                     ("+", b0+16, b0+8, b0+8)],   # 128 = 64+64
+                     ("+", b0+16, b0+8, b0+8),   # 128 = 64+64
+                     ("+", tmp1, fvp, b0+1)],     # forest_values_p + 8
              "valu": [("vbroadcast", threes, threes),
                       ("+", twos, ones, ones)]},
 
@@ -211,13 +216,15 @@ class KernelBuilder:
                      ("+", b0+28, b0+12, b0+16),  # 224 = 96+128
                      ("+", b0+29, b0+13, b0+16),  # 232 = 104+128
                      ("+", b0+30, b0+14, b0+16),  # 240 = 112+128
-                     ("+", b0+31, b0+15, b0+16)], # 248 = 120+128
+                     ("+", b0+31, b0+15, b0+16),  # 248 = 120+128
+                     ("+", v[4], twos, twos)],     # scalar 4 = 2+2
              "valu": [("vbroadcast", sfvv + i*VLEN, sfv + i) for i in range(5, 8)] +
                      [("vbroadcast", v[16], v[16]),
                       ("vbroadcast", v[19], v[19])]},
 
-            # C5: hash val1 pair 1; broadcast v33, v4097
+            # C5: hash val1 pair 1; broadcast v33, v4097; scalar 7
             {"load": [("const", v[0x7ED55D16], 0x7ED55D16), ("const", v[0xC761C23C], 0xC761C23C)],
+             "alu": [("+", v[7], threes, v[4])],
              "valu": [("vbroadcast", v[33], v[33]),
                       ("vbroadcast", v[4097], v[4097])]},
 
@@ -231,9 +238,18 @@ class KernelBuilder:
              "valu": [("vbroadcast", v[0x165667B1], v[0x165667B1]),
                       ("vbroadcast", v[0xD3A2646C], v[0xD3A2646C])]},
 
-            # C8: broadcast final hash pair
-            {"valu": [("vbroadcast", v[0xFD7046C5], v[0xFD7046C5]),
-                      ("vbroadcast", v[0xB55A4F09], v[0xB55A4F09])]},
+            # C8: vload forest vals 8-15; broadcast final hash pair + v4, v7
+            {"load": [("vload", sfv2, tmp1)],
+             "valu": [("vbroadcast", v[0xFD7046C5], v[0xFD7046C5]),
+                      ("vbroadcast", v[0xB55A4F09], v[0xB55A4F09]),
+                      ("vbroadcast", v[4], v[4]),
+                      ("vbroadcast", v[7], v[7])]},
+
+            # C9: broadcast forest vals 8-13
+            {"valu": [("vbroadcast", sfvv2 + i*VLEN, sfv2 + i) for i in range(6)]},
+
+            # C10: broadcast forest val 14
+            {"valu": [("vbroadcast", sfvv2 + 6*VLEN, sfv2 + 6)]},
         ]
         self.instrs.extend(init)
 
@@ -347,8 +363,7 @@ class KernelBuilder:
 
         if round % (self.forest_height + 1) == 0:
             # 1 valu (can be 0 for round 0)
-            vvals = self.scratch["short_forest_vec_vals"]
-            instrs.append({"valu": [("+", tmp_node_val, zeros, vvals)]})
+            pass
         # elif round % (self.forest_height + 1) == 1 and not (round == 1 and batch_base < 4):
         elif round % (self.forest_height + 1) == 1 and not (round == 1 and batch_base < 1):
             # 3 valu
@@ -415,6 +430,42 @@ class KernelBuilder:
             instrs.append({"valu": [
                 ("multiply_add", tmp_node_val, da, bit1, d01),
             ]})
+        # elif round % (self.forest_height + 1) == 3 and not ((round == 3 and batch < 8) or (round > 10 and batch > 30)):
+        elif round % (self.forest_height + 1) == 3: 
+            # Level 3: vselect among nodes 7-14
+            vvals = self.scratch["short_forest_vec_vals"]
+            sfvv2_addr = self.scratch["short_forest_vec_vals2"]
+            vec_7 = self.vscratch_const(7)
+            vec_4 = self.vscratch_const(4)
+
+            nv7  = vvals + VLEN * 7
+            nv8  = sfvv2_addr
+            nv9  = sfvv2_addr + VLEN
+            nv10 = sfvv2_addr + VLEN * 2
+            nv11 = sfvv2_addr + VLEN * 3
+            nv12 = sfvv2_addr + VLEN * 4
+            nv13 = sfvv2_addr + VLEN * 5
+            nv14 = sfvv2_addr + VLEN * 6
+
+            # offset = idx - 7
+            instrs.append({"valu": [("-", vtmp1, tmp_idx, vec_7)]})
+            # bit0 = offset & 1, bit1_mask = offset & 2
+            instrs.append({"valu": [
+                ("&", vtmp2, vtmp1, ones),
+                ("&", vtmp3, vtmp1, twos),
+            ]})
+            # Lower half: select among nodes 7-10
+            instrs.append({"flow": [("vselect", tmp_node_val, vtmp2, nv8, nv7)]})
+            instrs.append({"flow": [("vselect", vtmp1, vtmp2, nv10, nv9)]})
+            instrs.append({"flow": [("vselect", vtmp1, vtmp3, vtmp1, tmp_node_val)]})
+            # Upper half: select among nodes 11-14
+            instrs.append({"flow": [("vselect", tmp_node_val, vtmp2, nv12, nv11)]})
+            instrs.append({"flow": [("vselect", vtmp2, vtmp2, nv14, nv13)]})
+            instrs.append({"flow": [("vselect", tmp_node_val, vtmp3, vtmp2, tmp_node_val)]})
+            # bit2 = (idx - 7) & 4; final select between halves
+            instrs.append({"valu": [("-", vtmp2, tmp_idx, vec_7)]})
+            instrs.append({"valu": [("&", vtmp2, vtmp2, vec_4)]})
+            instrs.append({"flow": [("vselect", tmp_node_val, vtmp2, tmp_node_val, vtmp1)]})
         else:
             # 8 alu (1 valu equiv)
             # Bad scalar loads and counter incrs to handle non-contiguous value loads
@@ -424,7 +475,12 @@ class KernelBuilder:
 
         # val = myhash(val ^ node_val)
         # 13 valu
-        instrs.append({"valu": [("^", tmp_val, tmp_val, tmp_node_val)]})
+        if round % (self.forest_height + 1) == 0:
+            vvals = self.scratch["short_forest_vec_vals"]
+            # instrs.append({"valu": [("+", tmp_node_val, zeros, vvals)]})
+            instrs.append({"valu": [("^", tmp_val, tmp_val, vvals)]})
+        else:
+            instrs.append({"valu": [("^", tmp_val, tmp_val, tmp_node_val)]})
         instrs.extend(self.build_hash(tmp_val, vtmp1, vtmp2, round, batch_base))
 
 
