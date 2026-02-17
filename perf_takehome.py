@@ -41,6 +41,8 @@ from problem import (
     reference_kernel2,
 )
 
+_STRIP_META = True
+
 DEFAULT_PARAMS = {
     # build_group guard thresholds: batch_base < threshold falls to scalar loads
     # (0=no guard, 1-8=exclude 1 group, 9-16=exclude 2 groups, etc.)
@@ -59,6 +61,7 @@ DEFAULT_PARAMS = {
     "groups_per_chunk_cap": 18,
     # Engine fill priority order
     "engine_order": ("load", "valu", "alu", "flow", "store"),
+
 }
 
 
@@ -323,6 +326,11 @@ class KernelBuilder:
         self.instrs.extend(instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
+
+        if _STRIP_META:
+            for instr in instrs:
+                if "_meta" in instr:
+                    del instr["_meta"]
 
     def build_group_load(
         self, batch: int, round, 
