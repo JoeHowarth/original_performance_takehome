@@ -1,6 +1,8 @@
 from collections import defaultdict
+import itertools
+import random
 
-from problem import SLOT_LIMITS
+from problem import SLOT_LIMITS, VLEN
 
 
 def sweep_params(param_grid: dict = None, seed: int = 123, top_n: int = 10):
