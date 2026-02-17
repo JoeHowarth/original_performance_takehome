@@ -47,12 +47,16 @@ DEFAULT_PARAMS = {
     "level1_guard": 0,
     "level2_guard": 0,
     "level3_guard": 0,
+    # Node lookup mode per depth: "valu" (multiply_add tree) or "vselect" (flow-based)
+    "depth1_mode": "vselect",
+    "depth2_mode": "vselect",
+    "depth3_mode": "vselect",
     # Packer stream selection heuristic
     "packer_short_threshold": 12,
-    "packer_medium_threshold": 14,
-    "packer_random_prob": 0.8,
+    "packer_medium_threshold": 18,
+    "packer_random_prob": 0.5,
     # Max groups processed simultaneously (limited by scratch space)
-    "groups_per_chunk_cap": 19,
+    "groups_per_chunk_cap": 18,
     # Engine fill priority order
     "engine_order": ("load", "valu", "alu", "flow", "store"),
 }
@@ -381,81 +385,66 @@ class KernelBuilder:
         twos = self.vscratch_const(2, "twos")
 
         # node_val = mem[forest_values_p + idx]
+        level = round % (self.forest_height + 1)
 
-        if round % (self.forest_height + 1) == 0:
-            # 1 valu (can be 0 for round 0)
+        if level == 0:
             pass
-        elif round % (self.forest_height + 1) == 1 and not (round == 1 and batch_base < self.params["level1_guard"]):
-            # 3 valu
+        elif level == 1 and not (round == 1 and batch_base < self.params["level1_guard"]):
             vvals = self.scratch["short_forest_vec_vals"]
-            offset = vtmp1
-            diff = vtmp2
-            vf1 = vvals + VLEN * 1
-            vf2 = vvals + VLEN * 2
-            instrs.append({"valu": [
-                ("-", offset, tmp_idx, ones), 
-                ("-", diff, vf2, vf1)
-            ]})
-            instrs.append({"valu": [("multiply_add", tmp_node_val, diff, offset, vf1)]})
-
-            # instrs.append({"valu": ["%", vtmp1, ]})
-
-            # Option A: flow-heavy (1 flow + 2 valu)
-            # valu:  vmod tmp, val, 2
-            # valu:  veq  mask, tmp, 0  
-            # flow:  vselect child, mask, one_vec, two_vec   # bottleneck: 1 flow slot
-        elif round % (self.forest_height + 1) == 2 and not (round == 2 and batch_base < self.params["level2_guard"]):
-            # 9 valu
+            nv1 = vvals + VLEN * 1
+            nv2 = vvals + VLEN * 2
+            if self.params["depth1_mode"] == "vselect":
+                # 1 valu + 1 flow
+                instrs.append({"valu": [("-", vtmp1, tmp_idx, ones)]})
+                instrs.append({"flow": [("vselect", tmp_node_val, vtmp1, nv2, nv1)]})
+            else:
+                # 3 valu in 2 cycles (multiply_add interpolation)
+                instrs.append({"valu": [
+                    ("-", vtmp1, tmp_idx, ones),
+                    ("-", vtmp2, nv2, nv1),
+                ]})
+                instrs.append({"valu": [("multiply_add", tmp_node_val, vtmp2, vtmp1, nv1)]})
+        elif level == 2 and not (round == 2 and batch_base < self.params["level2_guard"]):
             vvals = self.scratch["short_forest_vec_vals"]
             vec_3 = self.vscratch_const(3, "threes")
-
-            vf3 = vvals + VLEN * 3
-            vf4 = vvals + VLEN * 4
-            vf5 = vvals + VLEN * 5
-            vf6 = vvals + VLEN * 6
-
-            offset = vtmp1
-            bit0   = vtmp2
-            bit1   = vtmp3
-            d01    = tmp_addr      # reuse
-            d23    = tmp_addr2     # reuse
-
-            # Cycle 1: offset + level-1 diffs [3 valu]
-            instrs.append({"valu": [
-                ("-", offset, tmp_idx, vec_3), 
-                ("-", d01, vf4, vf3),
-                ("-", d23, vf6, vf5),
-            ]})
-
-            # Cycle 2: bit extraction [2 valu]
-            instrs.append({"valu": [
-                ("&",  bit0, offset, ones),
-                (">>", bit1, offset, ones),   # max val 1, no mask needed
-            ]})
-
-            # Cycle 3: level-1 selects [2 valu]
-            instrs.append({"valu": [
-                ("multiply_add", d01, d01, bit0, vf3),    # r01
-                ("multiply_add", d23, d23, bit0, vf5),    # r23
-            ]})
-
-            # Cycle 4: level-2 diff [1 valu]
-            da = offset  # dead, reuse
-            instrs.append({"valu": [
-                ("-", da, d23, d01),
-            ]})
-
-            # Cycle 5: level-2 select [1 valu]
-            instrs.append({"valu": [
-                ("multiply_add", tmp_node_val, da, bit1, d01),
-            ]})
-        elif round % (self.forest_height + 1) == 3 and not (round == 3 and batch_base < self.params["level3_guard"]):
-            # Level 3: vselect among nodes 7-14
+            nv3 = vvals + VLEN * 3
+            nv4 = vvals + VLEN * 4
+            nv5 = vvals + VLEN * 5
+            nv6 = vvals + VLEN * 6
+            if self.params["depth2_mode"] == "vselect":
+                # 2 valu + 3 flow
+                instrs.append({"valu": [("-", vtmp1, tmp_idx, vec_3)]})
+                instrs.append({"valu": [
+                    ("&", vtmp2, vtmp1, ones),
+                    ("&", vtmp3, vtmp1, twos),
+                ]})
+                instrs.append({"flow": [("vselect", tmp_node_val, vtmp2, nv4, nv3)]})
+                instrs.append({"flow": [("vselect", vtmp1, vtmp2, nv6, nv5)]})
+                instrs.append({"flow": [("vselect", tmp_node_val, vtmp3, vtmp1, tmp_node_val)]})
+            else:
+                # 9 valu in 5 cycles (2-level multiply_add tree)
+                d01 = tmp_addr
+                d23 = tmp_addr2
+                instrs.append({"valu": [
+                    ("-", vtmp1, tmp_idx, vec_3),
+                    ("-", d01, nv4, nv3),
+                    ("-", d23, nv6, nv5),
+                ]})
+                instrs.append({"valu": [
+                    ("&",  vtmp2, vtmp1, ones),
+                    (">>", vtmp3, vtmp1, ones),
+                ]})
+                instrs.append({"valu": [
+                    ("multiply_add", d01, d01, vtmp2, nv3),
+                    ("multiply_add", d23, d23, vtmp2, nv5),
+                ]})
+                instrs.append({"valu": [("-", vtmp1, d23, d01)]})
+                instrs.append({"valu": [("multiply_add", tmp_node_val, vtmp1, vtmp3, d01)]})
+        elif level == 3 and not (round == 3 and batch_base < self.params["level3_guard"]):
             vvals = self.scratch["short_forest_vec_vals"]
             sfvv2_addr = self.scratch["short_forest_vec_vals2"]
             vec_7 = self.vscratch_const(7)
             vec_4 = self.vscratch_const(4)
-
             nv7  = vvals + VLEN * 7
             nv8  = sfvv2_addr
             nv9  = sfvv2_addr + VLEN
@@ -464,38 +453,74 @@ class KernelBuilder:
             nv12 = sfvv2_addr + VLEN * 4
             nv13 = sfvv2_addr + VLEN * 5
             nv14 = sfvv2_addr + VLEN * 6
-
-            # offset = idx - 7
-            instrs.append({"valu": [("-", vtmp1, tmp_idx, vec_7)]})
-            # bit0 = offset & 1, bit1_mask = offset & 2
-            instrs.append({"valu": [
-                ("&", vtmp2, vtmp1, ones),
-                ("&", vtmp3, vtmp1, twos),
-            ]})
-            # Lower half: select among nodes 7-10
-            instrs.append({"flow": [("vselect", tmp_node_val, vtmp2, nv8, nv7)]})
-            instrs.append({"flow": [("vselect", vtmp1, vtmp2, nv10, nv9)]})
-            instrs.append({"flow": [("vselect", vtmp1, vtmp3, vtmp1, tmp_node_val)]})
-            # Upper half: select among nodes 11-14
-            instrs.append({"flow": [("vselect", tmp_node_val, vtmp2, nv12, nv11)]})
-            instrs.append({"flow": [("vselect", vtmp2, vtmp2, nv14, nv13)]})
-            instrs.append({"flow": [("vselect", tmp_node_val, vtmp3, vtmp2, tmp_node_val)]})
-            # bit2 = (idx - 7) & 4; final select between halves
-            instrs.append({"valu": [("-", vtmp2, tmp_idx, vec_7)]})
-            instrs.append({"valu": [("&", vtmp2, vtmp2, vec_4)]})
-            instrs.append({"flow": [("vselect", tmp_node_val, vtmp2, tmp_node_val, vtmp1)]})
+            if self.params["depth3_mode"] == "vselect":
+                # 4 valu + 7 flow
+                instrs.append({"valu": [("-", vtmp1, tmp_idx, vec_7)]})
+                instrs.append({"valu": [
+                    ("&", vtmp2, vtmp1, ones),
+                    ("&", vtmp3, vtmp1, twos),
+                ]})
+                instrs.append({"flow": [("vselect", tmp_node_val, vtmp2, nv8, nv7)]})
+                instrs.append({"flow": [("vselect", vtmp1, vtmp2, nv10, nv9)]})
+                instrs.append({"flow": [("vselect", vtmp1, vtmp3, vtmp1, tmp_node_val)]})
+                instrs.append({"flow": [("vselect", tmp_node_val, vtmp2, nv12, nv11)]})
+                instrs.append({"flow": [("vselect", vtmp2, vtmp2, nv14, nv13)]})
+                instrs.append({"flow": [("vselect", tmp_node_val, vtmp3, vtmp2, tmp_node_val)]})
+                instrs.append({"valu": [("-", vtmp2, tmp_idx, vec_7)]})
+                instrs.append({"valu": [("&", vtmp2, vtmp2, vec_4)]})
+                instrs.append({"flow": [("vselect", tmp_node_val, vtmp2, tmp_node_val, vtmp1)]})
+            else:
+                # 20 valu in 8 cycles (3-level multiply_add tree)
+                # Cycle 1: offset + 4 level-1 diffs [5 valu]
+                instrs.append({"valu": [
+                    ("-", vtmp1, tmp_idx, vec_7),
+                    ("-", tmp_addr, nv8, nv7),
+                    ("-", tmp_addr2, nv10, nv9),
+                    ("-", vtmp2, nv12, nv11),
+                    ("-", vtmp3, nv14, nv13),
+                ]})
+                # Cycle 2: bit0 + shift [2 valu]
+                instrs.append({"valu": [
+                    ("&", tmp_node_val, vtmp1, ones),
+                    (">>", vtmp1, vtmp1, ones),
+                ]})
+                # Cycle 3: 4 level-1 selects using bit0 [4 multiply_add]
+                instrs.append({"valu": [
+                    ("multiply_add", tmp_addr, tmp_addr, tmp_node_val, nv7),
+                    ("multiply_add", tmp_addr2, tmp_addr2, tmp_node_val, nv9),
+                    ("multiply_add", vtmp2, vtmp2, tmp_node_val, nv11),
+                    ("multiply_add", vtmp3, vtmp3, tmp_node_val, nv13),
+                ]})
+                # Cycle 4: bit1, bit2 from offset>>1 [2 valu]
+                instrs.append({"valu": [
+                    ("&", tmp_node_val, vtmp1, ones),
+                    (">>", vtmp1, vtmp1, ones),
+                ]})
+                # tmp_node_val=bit1, vtmp1=bit2, tmp_addr=r01, tmp_addr2=r23, vtmp2=r45, vtmp3=r67
+                # Cycle 5: level-2 diffs [2 valu]
+                instrs.append({"valu": [
+                    ("-", tmp_addr2, tmp_addr2, tmp_addr),
+                    ("-", vtmp3, vtmp3, vtmp2),
+                ]})
+                # Cycle 6: level-2 selects [2 multiply_add]
+                instrs.append({"valu": [
+                    ("multiply_add", tmp_addr2, tmp_addr2, tmp_node_val, tmp_addr),
+                    ("multiply_add", vtmp3, vtmp3, tmp_node_val, vtmp2),
+                ]})
+                # Cycle 7: level-3 diff [1 valu]
+                instrs.append({"valu": [("-", vtmp3, vtmp3, tmp_addr2)]})
+                # Cycle 8: level-3 select [1 multiply_add]
+                instrs.append({"valu": [("multiply_add", tmp_node_val, vtmp3, vtmp1, tmp_addr2)]})
         else:
-            # 8 alu (1 valu equiv)
-            # Bad scalar loads and counter incrs to handle non-contiguous value loads
+            # Scalar loads fallback for deeper levels
             instrs.append({"alu": [("+", vtmp3 + j, self.scratch["forest_values_p"], tmp_idx + j) for j in range(8)]})
             for j in range(0, 8, 2):
                 instrs.append({"load": [("load", tmp_node_val + j, vtmp3 + j), ("load", tmp_node_val + j + 1, vtmp3 + j + 1)]})
 
         # val = myhash(val ^ node_val)
         # 13 valu
-        if round % (self.forest_height + 1) == 0:
+        if level == 0:
             vvals = self.scratch["short_forest_vec_vals"]
-            # instrs.append({"valu": [("+", tmp_node_val, zeros, vvals)]})
             instrs.append({"valu": [("^", tmp_val, tmp_val, vvals)]})
         else:
             instrs.append({"valu": [("^", tmp_val, tmp_val, tmp_node_val)]})
