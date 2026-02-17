@@ -44,15 +44,16 @@ from problem import (
 _STRIP_META = True
 
 DEFAULT_PARAMS = {
-    # build_group guard thresholds: batch_base < threshold falls to scalar loads
-    # (0=no guard, 1-8=exclude 1 group, 9-16=exclude 2 groups, etc.)
+    # Per-depth vselect cutoff: groups with batch_base < cutoff use vselect,
+    # rest use valu. 0=all valu, 256=all vselect. (batch_size=256)
+    "depth1_vselect_cutoff": 216,
+    "depth2_vselect_cutoff": 216,
+    # depth3 always vselect (valu path has a bug)
+    # Per-depth scalar fallback guard: on first occurrence of a level,
+    # groups with batch_base < guard fall back to scalar loads
     "level1_guard": 0,
     "level2_guard": 0,
     "level3_guard": 0,
-    # Node lookup mode per depth: "valu" (multiply_add tree) or "vselect" (flow-based)
-    "depth1_mode": "vselect",
-    "depth2_mode": "vselect",
-    "depth3_mode": "vselect",
     # Packer stream selection heuristic
     "packer_short_threshold": 12,
     "packer_medium_threshold": 18,
@@ -61,7 +62,8 @@ DEFAULT_PARAMS = {
     "groups_per_chunk_cap": 18,
     # Engine fill priority order
     "engine_order": ("load", "valu", "alu", "flow", "store"),
-
+    # Packer internal RNG seed (deterministic regardless of external random state)
+    "packer_seed": 35,
 }
 
 
@@ -401,7 +403,7 @@ class KernelBuilder:
             vvals = self.scratch["short_forest_vec_vals"]
             nv1 = vvals + VLEN * 1
             nv2 = vvals + VLEN * 2
-            if self.params["depth1_mode"] == "vselect":
+            if batch_base < self.params["depth1_vselect_cutoff"]:
                 # 1 valu + 1 flow
                 instrs.append({"valu": [("-", vtmp1, tmp_idx, ones)]})
                 instrs.append({"flow": [("vselect", tmp_node_val, vtmp1, nv2, nv1)]})
@@ -419,7 +421,7 @@ class KernelBuilder:
             nv4 = vvals + VLEN * 4
             nv5 = vvals + VLEN * 5
             nv6 = vvals + VLEN * 6
-            if self.params["depth2_mode"] == "vselect":
+            if batch_base < self.params["depth2_vselect_cutoff"]:
                 # 2 valu + 3 flow
                 instrs.append({"valu": [("-", vtmp1, tmp_idx, vec_3)]})
                 instrs.append({"valu": [
@@ -461,64 +463,21 @@ class KernelBuilder:
             nv12 = sfvv2_addr + VLEN * 4
             nv13 = sfvv2_addr + VLEN * 5
             nv14 = sfvv2_addr + VLEN * 6
-            if self.params["depth3_mode"] == "vselect":
-                # 4 valu + 7 flow
-                instrs.append({"valu": [("-", vtmp1, tmp_idx, vec_7)]})
-                instrs.append({"valu": [
-                    ("&", vtmp2, vtmp1, ones),
-                    ("&", vtmp3, vtmp1, twos),
-                ]})
-                instrs.append({"flow": [("vselect", tmp_node_val, vtmp2, nv8, nv7)]})
-                instrs.append({"flow": [("vselect", vtmp1, vtmp2, nv10, nv9)]})
-                instrs.append({"flow": [("vselect", vtmp1, vtmp3, vtmp1, tmp_node_val)]})
-                instrs.append({"flow": [("vselect", tmp_node_val, vtmp2, nv12, nv11)]})
-                instrs.append({"flow": [("vselect", vtmp2, vtmp2, nv14, nv13)]})
-                instrs.append({"flow": [("vselect", tmp_node_val, vtmp3, vtmp2, tmp_node_val)]})
-                instrs.append({"valu": [("-", vtmp2, tmp_idx, vec_7)]})
-                instrs.append({"valu": [("&", vtmp2, vtmp2, vec_4)]})
-                instrs.append({"flow": [("vselect", tmp_node_val, vtmp2, tmp_node_val, vtmp1)]})
-            else:
-                # 20 valu in 8 cycles (3-level multiply_add tree)
-                # Cycle 1: offset + 4 level-1 diffs [5 valu]
-                instrs.append({"valu": [
-                    ("-", vtmp1, tmp_idx, vec_7),
-                    ("-", tmp_addr, nv8, nv7),
-                    ("-", tmp_addr2, nv10, nv9),
-                    ("-", vtmp2, nv12, nv11),
-                    ("-", vtmp3, nv14, nv13),
-                ]})
-                # Cycle 2: bit0 + shift [2 valu]
-                instrs.append({"valu": [
-                    ("&", tmp_node_val, vtmp1, ones),
-                    (">>", vtmp1, vtmp1, ones),
-                ]})
-                # Cycle 3: 4 level-1 selects using bit0 [4 multiply_add]
-                instrs.append({"valu": [
-                    ("multiply_add", tmp_addr, tmp_addr, tmp_node_val, nv7),
-                    ("multiply_add", tmp_addr2, tmp_addr2, tmp_node_val, nv9),
-                    ("multiply_add", vtmp2, vtmp2, tmp_node_val, nv11),
-                    ("multiply_add", vtmp3, vtmp3, tmp_node_val, nv13),
-                ]})
-                # Cycle 4: bit1, bit2 from offset>>1 [2 valu]
-                instrs.append({"valu": [
-                    ("&", tmp_node_val, vtmp1, ones),
-                    (">>", vtmp1, vtmp1, ones),
-                ]})
-                # tmp_node_val=bit1, vtmp1=bit2, tmp_addr=r01, tmp_addr2=r23, vtmp2=r45, vtmp3=r67
-                # Cycle 5: level-2 diffs [2 valu]
-                instrs.append({"valu": [
-                    ("-", tmp_addr2, tmp_addr2, tmp_addr),
-                    ("-", vtmp3, vtmp3, vtmp2),
-                ]})
-                # Cycle 6: level-2 selects [2 multiply_add]
-                instrs.append({"valu": [
-                    ("multiply_add", tmp_addr2, tmp_addr2, tmp_node_val, tmp_addr),
-                    ("multiply_add", vtmp3, vtmp3, tmp_node_val, vtmp2),
-                ]})
-                # Cycle 7: level-3 diff [1 valu]
-                instrs.append({"valu": [("-", vtmp3, vtmp3, tmp_addr2)]})
-                # Cycle 8: level-3 select [1 multiply_add]
-                instrs.append({"valu": [("multiply_add", tmp_node_val, vtmp3, vtmp1, tmp_addr2)]})
+            # 4 valu + 7 flow (vselect only, valu path disabled)
+            instrs.append({"valu": [("-", vtmp1, tmp_idx, vec_7)]})
+            instrs.append({"valu": [
+                ("&", vtmp2, vtmp1, ones),
+                ("&", vtmp3, vtmp1, twos),
+            ]})
+            instrs.append({"flow": [("vselect", tmp_node_val, vtmp2, nv8, nv7)]})
+            instrs.append({"flow": [("vselect", vtmp1, vtmp2, nv10, nv9)]})
+            instrs.append({"flow": [("vselect", vtmp1, vtmp3, vtmp1, tmp_node_val)]})
+            instrs.append({"flow": [("vselect", tmp_node_val, vtmp2, nv12, nv11)]})
+            instrs.append({"flow": [("vselect", vtmp2, vtmp2, nv14, nv13)]})
+            instrs.append({"flow": [("vselect", tmp_node_val, vtmp3, vtmp2, tmp_node_val)]})
+            instrs.append({"valu": [("-", vtmp2, tmp_idx, vec_7)]})
+            instrs.append({"valu": [("&", vtmp2, vtmp2, vec_4)]})
+            instrs.append({"flow": [("vselect", tmp_node_val, vtmp2, tmp_node_val, vtmp1)]})
         else:
             # Scalar loads fallback for deeper levels
             instrs.append({"alu": [("+", vtmp3 + j, self.scratch["forest_values_p"], tmp_idx + j) for j in range(8)]})
@@ -557,14 +516,15 @@ def trim_stream(stream: list[dict]) -> None:
 
 def pick_frontier_with_engine(
     frontier: list[tuple[int, dict]], start: int, engine: str,
-    streams_by_len: list[tuple[int,int]], params: dict = None
+    streams_by_len: list[tuple[int,int]], params: dict = None,
+    rng: random.Random = None,
 ) -> int | None:
     if params is None:
         params = DEFAULT_PARAMS
     n = len(frontier)
 
     l = len(streams_by_len)
-    if l < params["packer_short_threshold"] or (l < params["packer_medium_threshold"] and random.random() > params["packer_random_prob"]):
+    if l < params["packer_short_threshold"] or (l < params["packer_medium_threshold"] and rng.random() > params["packer_random_prob"]):
         for _,si in streams_by_len:
             _, head = frontier[si]
             if head.get(engine):
@@ -580,6 +540,7 @@ def pick_frontier_with_engine(
 def cross_packer(streams: list[list[dict]], params: dict = None):
     if params is None:
         params = DEFAULT_PARAMS
+    rng = random.Random(params.get("packer_seed", 42))
     packed = []
     engine_order = params["engine_order"]
     streams = [pack_debug(s) for s in streams if s]
@@ -616,7 +577,7 @@ def cross_packer(streams: list[list[dict]], params: dict = None):
                 goal = SLOT_LIMITS[engine] - len(instr[engine])
                 while goal > 0:
                     streams_by_len = sorted((-len(stream), si) for si,stream in enumerate(streams))
-                    fi = pick_frontier_with_engine(frontier, rr, engine, streams_by_len, params)
+                    fi = pick_frontier_with_engine(frontier, rr, engine, streams_by_len, params, rng)
                     if fi is None:
                         break
 
@@ -969,6 +930,59 @@ def sweep_params(param_grid: dict = None, seed: int = 123, top_n: int = 10):
     for cycles, _, overrides in results[-3:]:
         delta = {k: v for k, v in overrides.items() if v != DEFAULT_PARAMS.get(k)}
         print(f"  {cycles} cycles  delta={delta}")
+
+    return results
+
+
+def random_sweep(n_samples: int = 500, seed: int = 42, top_n: int = 15):
+    """
+    Random sampling over a large parameter space including per-group
+    vselect/valu cutoffs (in multiples of VLEN=8).
+    """
+    rng = random.Random(seed)
+    batch_size = 256
+    # Cutoff values: multiples of 8 from 0 to 256 inclusive
+    cutoff_choices = list(range(0, batch_size + 1, VLEN))  # 0,8,16,...,256
+
+    results = []
+    best_so_far = float("inf")
+    print(f"Random sweep: {n_samples} samples")
+
+    for idx in range(n_samples):
+        overrides = {
+            "depth1_vselect_cutoff": rng.choice(cutoff_choices),
+            "depth2_vselect_cutoff": rng.choice(cutoff_choices),
+            "level1_guard": rng.choice([0, 8, 16]),
+            "level2_guard": rng.choice([0, 8, 16]),
+            "level3_guard": rng.choice([0, 8, 16]),
+            "packer_short_threshold": rng.randint(4, 20),
+            "packer_medium_threshold": rng.randint(8, 28),
+            "packer_random_prob": rng.choice([0.0, 0.2, 0.3, 0.5, 0.7, 0.8, 1.0]),
+            "groups_per_chunk_cap": rng.randint(14, 22),
+        }
+        params = {**DEFAULT_PARAMS, **overrides}
+        try:
+            cycles = do_kernel_test(10, 16, 256, seed=123, params=params, quiet=True)
+        except Exception as e:
+            print(f"  [{idx+1}/{n_samples}] FAIL: {e}")
+            continue
+        if cycles < best_so_far:
+            best_so_far = cycles
+            marker = " ***"
+        else:
+            marker = ""
+        results.append((cycles, idx, overrides))
+        if (idx + 1) % 100 == 0 or marker:
+            print(f"  [{idx+1}/{n_samples}] {cycles} cycles{marker}")
+
+    results.sort(key=lambda r: r[0])
+    print(f"\n=== Top {top_n} results ===")
+    for i, (cycles, _, ov) in enumerate(results[:top_n]):
+        print(f"  {i+1}. {cycles} cycles  (speedup {BASELINE/cycles:.1f}x)  {ov}")
+
+    print(f"\n=== Bottom 5 ===")
+    for cycles, _, ov in results[-5:]:
+        print(f"  {cycles} cycles  {ov}")
 
     return results
 
